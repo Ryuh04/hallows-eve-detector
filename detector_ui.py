@@ -1198,9 +1198,18 @@ class AccountRow(QFrame):
         self.launch_btn.setStyleSheet("padding: 8px 16px; font-size: 13px;")
         row.addWidget(self.launch_btn)
         col.addLayout(row)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         self.status = label("", "small", wrap=True)
-        col.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+        self.relaunch_btn = button("Relaunch", self._relaunch, icon_name="refresh",
+                                   tip="Close this account's Roblox window and open it again "
+                                       "in the server picked now")
+        self.relaunch_btn.hide()
+        status_row.addWidget(self.relaunch_btn, 0, Qt.AlignVCenter)
+        col.addLayout(status_row)
         self.show_status(*self.app.account_status.get(self.user_id, ("", MUTED)))
+        self.check_relaunch(quiet=True)
         self._confirm = None
 
     def show_server(self):
@@ -1229,8 +1238,25 @@ class AccountRow(QFrame):
         self.app.accounts.set_server(self.user_id, server_id)
         self.show_server()
         self.show_status("", MUTED)
+        self.check_relaunch()
         if self.dialog.servers_box.isVisible():
             self.dialog.rebuild_servers()
+
+    def check_relaunch(self, quiet=False):
+        """If this account's Roblox window is open in another server than the one picked
+        now, offer to relaunch it there. `quiet` keeps the status line as it is."""
+        account = self.app.accounts.get(self.user_id) or {}
+        server = self.app.accounts.server_of(account)
+        pid = self.app.account_pid(self.user_id) if server else None
+        stale = pid is not None and self.app.private_servers.get(pid, "") != server["link"]
+        if stale and not quiet:
+            self.show_status(f"Switched to {server['name']}. Its Roblox window (PID {pid}) is "
+                             "still in the old server.", WARN)
+        self.relaunch_btn.setVisible(stale)
+
+    def _relaunch(self):
+        self.relaunch_btn.hide()
+        self.app._launch_accounts([self.user_id], relaunch=True)
 
     def load_avatar(self):
         path = self.app.accounts.avatar_path(self.user_id)
@@ -1241,6 +1267,7 @@ class AccountRow(QFrame):
         self.status.setText(text)
         self.status.setStyleSheet(f"color:{color};")
         self.status.setVisible(bool(text))
+        self.relaunch_btn.hide()  # check_relaunch shows it again when it applies
 
     def _launch(self):
         self.app._launch_accounts([self.user_id])
@@ -1540,6 +1567,7 @@ class App(QMainWindow):
         self.session_slots = {}
         self.session_rebirth = set()
         self.window_names = core.load_window_names()  # pid -> name the user gave the window
+        self.no_ping = core.load_no_ping()  # names of windows that detect but don't ping Discord
         self.names = {}  # hwnd -> name, read by the monitor thread for its messages
         self.default_names = {}
         self.current_tab = None  # pid of the window whose panel is open
@@ -1556,7 +1584,8 @@ class App(QMainWindow):
         self.account_status = {}  # user ID -> (text, colour) of its last launch
         self.signin = None  # the open browser sign-in window (accounts.BrowserSignIn)
         self.signin_thread = None
-        self.launch_queue = queue.Queue()  # (user ID, cookie, link, name) waiting to launch
+        self.launch_queue = queue.Queue()  # (user ID, cookie, link, name, PID to close first)
+        self.account_pids = {}  # user ID -> PID of the Roblox window launched for it
         self.launcher = None
         self.watch_launched, self.auto_watch = {}, None  # launched windows to start watching
         self.watch_timer = QTimer(self)
@@ -2015,6 +2044,7 @@ class App(QMainWindow):
             self._style_hide(hwnd)
             self._style_slot(hwnd)
             self._style_rebirth(hwnd)
+            self._style_ping(hwnd)
         self._set_page(page)
         by_pid = {w["pid"]: hwnd for hwnd, w in self.rows.items()}
         self._open_tab(by_pid.get(self.current_tab, next(iter(self.rows))))
@@ -2056,6 +2086,7 @@ class App(QMainWindow):
         if self.notifier:
             self.notifier.enabled = self.discord_on
             self.notifier.link_for = self._private_server_of
+            self.notifier.ping_for = lambda label: label not in self.no_ping
 
             def check_discord(notifier=self.notifier):
                 # Look up the channel and role now, so setup problems show up before an event.
@@ -2172,6 +2203,11 @@ class App(QMainWindow):
         info_row.addWidget(button("Rebirth log", lambda h=hwnd: self._show_rebirth_log(h),
                                   icon_name="list"))
         auto_col.addLayout(info_row)
+        auto_col.addWidget(divider())
+        ping = Toggle(True)
+        ping.clicked.connect(lambda *_, h=hwnd: self._toggle_ping(h))
+        ping_row = SettingRow("chat", "Discord ping", "Ping when Hallows' Eve starts here", ping)
+        auto_col.addWidget(ping_row)
         auto_col.addStretch(1)
         grid.addWidget(live, 0, 0)
         grid.addWidget(auto, 0, 1)
@@ -2228,7 +2264,7 @@ class App(QMainWindow):
             "left": left, "caption": caption, "left_s": None, "image": image, "hide": hide,
             "live": live, "grid": grid, "auto": auto, "detect": detect, "detect_row": detect_row,
             "anti": anti, "anti_row": anti_row, "rebirth": rebirth, "rebirth_row": rebirth_row,
-            "rebirth_info": rebirth_info,
+            "rebirth_info": rebirth_info, "ping": ping, "ping_row": ping_row,
             "slot": slot, "strip": strip, "summary": summary, "warning": warning,
             "server_entry": server_entry, "server_hint": server_hint, "nav": nav, "wide": None}
 
@@ -2367,6 +2403,9 @@ class App(QMainWindow):
         else:
             self.window_names[widgets["pid"]] = name
         core.save_window_names(self.window_names)
+        if old in self.no_ping:  # the ping setting goes with the window
+            self.no_ping = (self.no_ping - {old}) | {name}
+            core.save_no_ping(self.no_ping)
         widgets["label"] = name
         self.names[hwnd] = name
         widgets["title"].setText(name)
@@ -2457,6 +2496,29 @@ class App(QMainWindow):
                       "unequipped).", "end")
         self._style_detection(hwnd)
         self._watching_status()
+
+    def _toggle_ping(self, hwnd):
+        """Whether a window pings Discord when Hallows' Eve starts there. Off: still detected
+        and equipped, just no ping. Kept by window name, so an account's window (named after
+        the account) keeps it across launches."""
+        name = self.rows[hwnd]["label"]
+        on = name in self.no_ping
+        self.no_ping = (self.no_ping - {name}) if on else (self.no_ping | {name})
+        core.save_no_ping(self.no_ping)
+        self._log(f"{name}: Discord ping on." if on else
+                  f"{name}: Discord ping off. Hallows' Eve is still detected there, just "
+                  "not pinged.", None if on else "end")
+        self._style_ping(hwnd)
+
+    def _style_ping(self, hwnd):
+        widgets = self.rows[hwnd]
+        on = widgets["label"] not in self.no_ping
+        widgets["ping"].setChecked(on)
+        widgets["ping_row"].set_on(on and self.discord_on and bool(self.notifier))
+        widgets["ping_row"].subtitle.setText(
+            "Off: detected here, but never pinged" if not on
+            else "Ping when Hallows' Eve starts here" if self.notifier and self.discord_on
+            else "On, but Discord pings are off (bottom left)")
 
     def _style_detection(self, hwnd):
         on = self.detecting.get(hwnd, True)
@@ -2578,6 +2640,8 @@ class App(QMainWindow):
         role = self.notifier.role_label or f"@{self.notifier.role}"
         self.discord_sub.setText(f"Pings {role}" if self.discord_on else "Paused")
         self.discord_badge.set_color(ACCENT if self.discord_on else MUTED)
+        for hwnd in self.rows:
+            self._style_ping(hwnd)
 
     # ------------------------------------------------------------------ accounts
 
@@ -2697,10 +2761,23 @@ class App(QMainWindow):
         if dialog is not None:
             dialog.rebuild()
 
-    def _launch_accounts(self, user_ids):
+    def account_pid(self, user_id):
+        """PID of the account's open Roblox window: the one launched for it, or else a window
+        named after it. None if it has none open."""
+        account = self.accounts.get(user_id)
+        if account is None:
+            return None
+        alive = {pid for _, pid, _ in core.find_roblox_windows()}
+        pid = self.account_pids.get(user_id)
+        if pid in alive:
+            return pid
+        name = core.clean_window_name(account["name"])
+        return next((p for p in sorted(alive) if self.window_names.get(p) == name), None)
+
+    def _launch_accounts(self, user_ids, relaunch=False):
         """Queue launches; they run one after another, each waiting for its Roblox window so
         the window can be told apart from the others (and given the account's name and its
-        private server link)."""
+        private server link). `relaunch` closes the account's open window first."""
         for user_id in user_ids:
             account = self.accounts.get(user_id)
             if account is None:
@@ -2717,17 +2794,26 @@ class App(QMainWindow):
                 continue
             self._set_account_status(user_id, "Waiting for the launch before it…"
                                      if self.launch_queue.unfinished_tasks else "Starting…")
-            self.launch_queue.put((user_id, cookie, link, account["name"]))
+            close = self.account_pid(user_id) if relaunch else None
+            self.launch_queue.put((user_id, cookie, link, account["name"], close))
         if self.launcher is None:
             self.launcher = threading.Thread(target=self._launch_worker, daemon=True)
             self.launcher.start()
 
     def _launch_worker(self):
         while True:
-            user_id, cookie, link, name = self.launch_queue.get()
+            user_id, cookie, link, name, close = self.launch_queue.get()
             try:
                 def post(text, color=MUTED):
                     self.events.put(("acct_status", None, user_id, text, color))
+
+                if close is not None:
+                    post("Closing the old Roblox window…")
+                    hwnds = [h for h, p, _ in core.find_roblox_windows() if p == close]
+                    if not accounts.close_roblox(close, hwnds):
+                        raise accounts.AccountError(f"Couldn't close the old Roblox window "
+                                                    f"(PID {close}). Close it, then click Launch.")
+                    self.events.put(("acct_closed", None, user_id, close))
 
                 accounts.allow_multiple_roblox()  # quick once the app owns the lock
                 before = {pid for _, pid, _ in core.find_roblox_windows()}
@@ -2752,6 +2838,7 @@ class App(QMainWindow):
             self._set_account_status(user_id, f"Roblox was started, but no new window showed up "
                                      f"within {accounts.WINDOW_WAIT} s.", WARN)
             return
+        self.account_pids[user_id] = pid
         self.private_servers[pid] = link
         core.save_private_servers(self.private_servers)
         if pid not in self.window_names:
@@ -2838,7 +2925,14 @@ class App(QMainWindow):
             time.sleep(5)
 
     def _account_event(self, kind, data):
-        if kind == "acct_multi":
+        if kind == "acct_closed":
+            user_id, pid = data
+            account = self.accounts.get(user_id) or {"name": "?"}
+            self._log(f"Accounts: closed @{account['name']}'s old Roblox window (PID {pid}) to "
+                      "relaunch it in its new server.")
+            self.private_servers.pop(pid, None)
+            core.save_private_servers(self.private_servers)
+        elif kind == "acct_multi":
             self.multi_roblox = data[0]
             dialog = self._accounts_window()
             if dialog is not None:

@@ -7,7 +7,7 @@ A Windows app that watches your Roblox windows for the **Hallows' Eve** event an
 - **Anti Disconnect:** reconnects after a disconnect and closes the "Welcome Back" popup.
 - **Auto rebirth:** rebirths whenever your cash covers the next rebirth, with a log.
 - **Trim Roblox RAM:** frees memory your Roblox windows aren't using, every 2 minutes (on by default).
-- **Discord ping** (optional) with each window's private server link.
+- **Discord ping** (optional) with each window's private server link. Switch it off per window to detect there without pinging.
 - **Account launcher:** save your Roblox accounts and launch each one straight into its private server, as many Roblox windows at once as you like.
 
 Every window has its own switches, so you can run several Roblox windows at once.
@@ -33,7 +33,7 @@ The app keeps your settings in `%LOCALAPPDATA%\Hallows Eve Detector`, so you can
 1. Pick the Roblox windows to watch, then **Start watching**. Windows can sit behind others, but they can't be minimised.
 2. Each window gets a page with:
    - its live view;
-   - switches for detection, Anti Disconnect and Auto rebirth;
+   - switches for detection, Anti Disconnect, Auto rebirth and **Discord ping** (turn the ping off to keep detecting in that window without pinging; it's remembered by window name, so an account's window keeps it across launches);
    - its hotbar: click characters there to auto equip them;
    - a box for the private server link.
 3. Double-click a window in the sidebar to rename it.
@@ -46,7 +46,7 @@ Click **Open** next to **Accounts** in the sidebar.
    - **Sign in with browser** opens the Roblox login page in a small Edge window. Sign in as usual; the window closes by itself and the account is saved. Repeat for each account.
    - **Add with cookie** lets you paste an account's `.ROBLOSECURITY` cookie instead.
 2. Save your private servers: click **Private servers**, give each one a name and paste its link (`roblox.com/share?code=…` or a `…?privateServerLinkCode=…` link), then **Add**. Rename a server by clicking its name; the bin removes it.
-3. Click an account's server box and pick the server it should join. Switch it the same way whenever you like.
+3. Click an account's server box and pick the server it should join. Switch it the same way whenever you like. If that account's Roblox window is already open in another server, a **Relaunch** button appears: it closes the old window and opens the account in the new server.
 4. Click **Launch** (or **Launch all**). Roblox opens signed in to that account and joins the server.
 
 Every launch opens its own Roblox window: while the app is open it owns Roblox's one-window lock (taking it over from a Roblox that was open first), so any number of Roblox windows run side by side, launched here or opened yourself. The new window is named after the account and gets its private server link for the Discord ping. With the account's **Start watching** switch on (the default), the app starts watching it straight away.

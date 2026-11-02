@@ -1843,6 +1843,7 @@ MUTATED_WARNING = "You have selected an already mutated character"
 UI_SETTINGS_PATH = APP_DIR / "ui_settings.json"  # remembered window size and position
 PRIVATE_SERVERS_PATH = APP_DIR / "private_servers.json"  # private server links, by Roblox process ID
 WINDOW_NAMES_PATH = APP_DIR / "window_names.json"  # names given to windows, by Roblox process ID
+NO_PING_PATH = APP_DIR / "no_ping.json"  # names of windows (accounts) that detect but don't ping
 
 
 def load_window_names():
@@ -1858,6 +1859,21 @@ def save_window_names(names):
     try:
         WINDOW_NAMES_PATH.write_text(json.dumps({str(pid): name for pid, name in names.items()},
                                                 indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_no_ping():
+    """Names of the windows that are watched but never ping Discord."""
+    try:
+        return {str(name) for name in json.loads(NO_PING_PATH.read_text(encoding="utf-8"))}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def save_no_ping(names):
+    try:
+        NO_PING_PATH.write_text(json.dumps(sorted(names), indent=1), encoding="utf-8")
     except OSError:
         pass
 
@@ -1974,6 +1990,7 @@ class DiscordNotifier:
         self.on_result = on_result or (lambda ok, text: print(text, flush=True))
         self.enabled = True
         self.link_for = lambda label: ""  # a window's private server link, by its name
+        self.ping_for = lambda label: True  # False for windows that detect but don't ping
         self.channel_id = self.channel_label = self.guild_id = None
         self.role_id = self.role_label = None
         self.role_mentionable = True
@@ -2013,6 +2030,7 @@ class DiscordNotifier:
                        if now - self._last_seen.get(label, -EVENT_GAP) >= EVENT_GAP]
             for label, _ in active_windows:
                 self._last_seen[label] = now
+            started = [(label, left) for label, left in started if self.ping_for(label)]
             if not started or not self.enabled:
                 return
             if self._last_ping is not None and now - self._last_ping < PING_COOLDOWN:

@@ -542,6 +542,30 @@ def allow_multiple_roblox(wait=10):
         return bool(_held and _held[0][1])
 
 
+def close_roblox(pid, hwnds, timeout=15):
+    """Close a Roblox client: ask its windows to close (like clicking X), and end the
+    process if it's still there after `timeout` seconds. True once it's gone."""
+    _user32 = ctypes.WinDLL("user32")
+    _user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    process = _kernel32.OpenProcess(0x00100000 | 0x0001, False, pid)  # SYNCHRONIZE | TERMINATE
+    if not process:
+        return True  # already gone (or not ours to close)
+    try:
+        for hwnd in hwnds:
+            _user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        if _kernel32.WaitForSingleObject(process, int(timeout * 1000)) == 0:
+            return True
+        _kernel32.TerminateProcess(process, 0)
+        return _kernel32.WaitForSingleObject(process, 5000) == 0
+    finally:
+        _kernel32.CloseHandle(process)
+
+
+_kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+_kernel32.WaitForSingleObject.restype = wt.DWORD
+_kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+
+
 # --------------------------------------------------------------------------- #
 # Signing in through a browser window
 # --------------------------------------------------------------------------- #

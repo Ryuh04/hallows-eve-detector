@@ -10,6 +10,7 @@ hidden_windows.json
 installed_version.json
 detector_output.log
 accounts.json
+no_ping.json
 accounts.json.tmp
 avatars/
 debug_captures/
