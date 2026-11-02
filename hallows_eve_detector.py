@@ -1217,12 +1217,10 @@ class PopupCloser:
 
 
 # --------------------------------------------------------------------------- #
-# Auto rebirth: open the Rebirth menu now and then, rebirth if the cash covers it
+# Auto rebirth: read the cost once, then rebirth as soon as the cash covers it
 # --------------------------------------------------------------------------- #
 
-REBIRTH_EVERY = 600.0  # the default (10 min); each window's slider changes its own
-# The slider's stops, in seconds.
-REBIRTH_INTERVALS = (3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1200, 1800)
+REBIRTH_EVERY = 10.0  # seconds between comparing the cash with the known cost
 REBIRTH_LOG_PATH = APP_DIR / "rebirth_log.csv"  # every rebirth: time, window, cash, cost
 # The game's number suffixes, smallest first.
 MONEY_SUFFIXES = ["", "k", "m", "b", "t", "qa", "qi", "sx", "sp", "oc", "no", "dc"]
@@ -1438,10 +1436,10 @@ def fresh_frame(hwnd, wait=0.0):
 
 
 class AutoRebirth:
-    """Every few seconds (each window's own `every`, REBIRTH_EVERY by default), for each window with it switched on: open the
-    Rebirth menu from the left-hand menu, compare the cost with the cash in the
-    bottom left, press Rebirth! if the cash covers it, and close the menu again.
-    Once the cost has been read, the menu isn't opened again until the cash covers it.
+    """For each window with it switched on: right away, open the Rebirth menu from the
+    left-hand menu to read the cost of the next rebirth. Then every REBIRTH_EVERY seconds,
+    compare that cost with the cash in the bottom left, and as soon as the cash covers
+    it, open the menu, press Rebirth! and close the menu again (reading the next cost).
 
     Runs on its own thread per window, so detection doesn't wait for it. Each
     rebirth is reported through on_action and added to REBIRTH_LOG_PATH.
@@ -1460,7 +1458,6 @@ class AutoRebirth:
         self.on_reading = on_reading or (lambda hwnd, text: None)
         self.on_stopped = None  # called with hwnd if a round had to switch itself off
         self.on = {}  # hwnd -> switched on
-        self.every = {}  # hwnd -> seconds between rounds (REBIRTH_EVERY if not set)
         self.last_run = {}
         self.known_cost = {}  # hwnd -> (cost, as written) of the next rebirth, once seen
         self.busy = set()
@@ -1469,15 +1466,16 @@ class AutoRebirth:
     def set_enabled(self, hwnd, on):
         with self._lock:
             self.on[hwnd] = on
-            if on:  # first look a few seconds after switching on, then every `every`
-                self.last_run[hwnd] = time.monotonic() - self.every.get(hwnd, REBIRTH_EVERY) + 5
+            if on:  # read the cost straight away, then compare every REBIRTH_EVERY
+                self.known_cost.pop(hwnd, None)
+                self.last_run[hwnd] = time.monotonic() - REBIRTH_EVERY
 
     def maybe_start(self, hwnd, label):
         """Start a round for this window if it's switched on and due."""
         with self._lock:
             if not self.on.get(hwnd) or hwnd in self.busy:
                 return False
-            if time.monotonic() - self.last_run.get(hwnd, 0) < self.every.get(hwnd, REBIRTH_EVERY):
+            if time.monotonic() - self.last_run.get(hwnd, 0) < REBIRTH_EVERY:
                 return False
             self.busy.add(hwnd)
             self.last_run[hwnd] = time.monotonic()

@@ -9,6 +9,9 @@ auto_rebirth.json
 hidden_windows.json
 installed_version.json
 detector_output.log
+accounts.json
+accounts.json.tmp
+avatars/
 debug_captures/
 
 # Shortcuts point at paths on one PC; Install.bat makes them

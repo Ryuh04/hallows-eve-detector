@@ -6,8 +6,9 @@ A Windows app that watches your Roblox windows for the **Hallows' Eve** event an
 - **Auto equip:** holds the characters you pick during the event, in the order you picked them, skipping any that already have Dracula, and unequips them when it ends.
 - **Anti Disconnect:** reconnects after a disconnect and closes the "Welcome Back" popup.
 - **Auto rebirth:** rebirths whenever your cash covers the next rebirth, with a log.
-- **Trim Roblox RAM:** frees memory your Roblox windows aren't using, every 2 minutes.
+- **Trim Roblox RAM:** frees memory your Roblox windows aren't using, every 2 minutes (on by default).
 - **Discord ping** (optional) with each window's private server link.
+- **Account launcher:** save your Roblox accounts and launch each one straight into its private server, as many Roblox windows at once as you like.
 
 Every window has its own switches, so you can run several Roblox windows at once.
 
@@ -36,6 +37,20 @@ The app keeps your settings in `%LOCALAPPDATA%\Hallows Eve Detector`, so you can
    - its hotbar: click characters there to auto equip them;
    - a box for the private server link.
 3. Double-click a window in the sidebar to rename it.
+
+## Accounts and launching Roblox
+
+Click **Open** next to **Accounts** in the sidebar.
+
+1. Add an account:
+   - **Sign in with browser** opens the Roblox login page in a small Edge window. Sign in as usual; the window closes by itself and the account is saved. Repeat for each account.
+   - **Add with cookie** lets you paste an account's `.ROBLOSECURITY` cookie instead.
+2. Paste a private server link into the account (`roblox.com/share?code=…` or a `…?privateServerLinkCode=…` link).
+3. Click **Launch** (or **Launch all**). Roblox opens signed in to that account and joins the server.
+
+Every launch opens its own Roblox window: while the app is open it owns Roblox's one-window lock (taking it over from a Roblox that was open first), so any number of Roblox windows run side by side, launched here or opened yourself. The new window is named after the account and gets its private server link, ready for **Manage → Start watching**.
+
+Sign-ins are saved in `accounts.json`, encrypted by Windows for your Windows user only, so the file is useless on any other PC. **Never share your cookie**: anyone who has it is signed in as you.
 
 ## Discord pings (optional)
 
@@ -67,8 +82,9 @@ You only need this to change the code; the .exe above is the same app.
 |---|---|
 | `hallows_eve_detector.py` | Watching, equipping, rebirths, Discord (also has a console mode: `--help`) |
 | `detector_ui.py` | The app window (Qt / PySide6) |
+| `accounts.py` | Saved accounts, browser sign-in, launching Roblox into a server |
 | `updater.py` | Check for updates / install them from this repository |
 | `build_exe.ps1`, `.github/workflows/build-exe.yml` | Build the .exe; GitHub does this on every push and publishes it as a release |
 | `Install.bat`, `create_shortcut.ps1` | Setup for running from source |
 
-Your own data stays on your PC and is never uploaded: `discord_config.json`, `private_servers.json`, `window_names.json`, `rebirth_log.csv`, `ui_settings.json` and `detector_output.log`.
+Your own data stays on your PC and is never uploaded: `discord_config.json`, `private_servers.json`, `window_names.json`, `rebirth_log.csv`, `ui_settings.json`, `detector_output.log`, `accounts.json` and `avatars/`.

@@ -5,7 +5,7 @@ hallows_eve_detector.py does the watching (capture, OCR, equipping, rebirths,
 Discord); this file is only the window around it. It's started from there with
 run(module, interval, debug), so both share one copy of the detector module.
 
-Layout: a sidebar (photo, status, the watched windows, session numbers, Discord)
+Layout: a sidebar (photo, status, the watched windows, accounts, session numbers, Discord)
 next to the main page, which is either the window picker or the open window's
 panel (live view, automation switches, hotbar, private server) above the activity
 feed. Worker threads hand results to the window through a queue it empties ten
@@ -28,9 +28,10 @@ from PySide6.QtGui import (QColor, QFont, QFontDatabase, QIcon, QImage, QPainter
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-                               QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget,
+                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
                                QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
+import accounts
 import updater
 
 core = None  # the detector module (hallows_eve_detector); set by run() or App()
@@ -101,6 +102,11 @@ ICONS = {
                 '<path d="M12 15V3"/>',
     "chip": '<rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/>'
             '<path d="M9 2v3M15 2v3M9 19v3M15 19v3M19 9h3M19 15h3M2 9h3M2 15h3"/>',
+    "users": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
+             '<path d="M22 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/>',
+    "log-in": '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/>'
+              '<path d="M15 12H3"/>',
+    "key": '<circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3L22 7l-3-3"/>',
 }
 
 _icon_cache = {}
@@ -191,12 +197,6 @@ def stylesheet(font):
     QScrollBar::handle:vertical:hover {{ background: #3a4356; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
-    QSlider {{ min-height: 22px; }}
-    QSlider::groove:horizontal {{ height: 4px; background: {HOVER}; border-radius: 2px; }}
-    QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
-    QSlider::handle:horizontal {{ background: {TEXT}; width: 14px; height: 14px; margin: -6px 0;
-                                 border-radius: 8px; border: 2px solid {ACCENT}; }}
-    QSlider::handle:horizontal:hover {{ background: #ffffff; }}
     QToolTip {{ background: {CARD_2}; color: {TEXT}; border: 1px solid {BORDER}; padding: 6px 8px; }}
     QTextEdit#feed {{ background: transparent; border: none; font-size: 12.5px; }}
     QTableWidget {{ background: transparent; border: none; outline: none; }}
@@ -619,42 +619,6 @@ class HotbarStrip(QWidget):
     def click_slot(self, slot):
         """For tests: the same as clicking that slot."""
         self.slot_clicked.emit(slot)
-
-
-class StepSlider(QSlider):
-    """A slider over a list of stops that jumps to where it's clicked. `released` fires once
-    the user lets go (after a drag or a click)."""
-
-    released = Signal(int)
-
-    def __init__(self, count, index):
-        super().__init__(Qt.Horizontal)
-        self.setRange(0, count - 1)
-        self.setPageStep(1)
-        self.setValue(index)
-        self.setCursor(Qt.PointingHandCursor)
-
-    def _value_at(self, x):
-        handle = 14
-        share = (x - handle / 2) / max(1, self.width() - handle)
-        return round(min(1.0, max(0.0, share)) * self.maximum())
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.setValue(self._value_at(event.position().x()))
-            self.setSliderDown(True)
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self.isSliderDown():
-            self.setValue(self._value_at(event.position().x()))
-
-    def mouseReleaseEvent(self, event):
-        if self.isSliderDown():
-            self.setSliderDown(False)
-            self.released.emit(self.value())
 
 
 class NavItem(QFrame):
@@ -1151,6 +1115,218 @@ class UpdateDialog(Dialog):
 # The main window
 # --------------------------------------------------------------------------- #
 
+class AccountRow(QFrame):
+    """One saved account: avatar, names, its private server link, Launch and Remove."""
+
+    def __init__(self, dialog, account):
+        super().__init__()
+        self.setObjectName("card")
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)  # the list scrolls instead
+        self.dialog, self.app, self.user_id = dialog, dialog.app, account["id"]
+        col = QVBoxLayout(self)
+        col.setContentsMargins(16, 14, 16, 14)
+        col.setSpacing(10)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self.avatar = ImageView("", radius=22)
+        self.avatar.setFixedSize(44, 44)
+        self.load_avatar()
+        top.addWidget(self.avatar)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(label(account.get("display") or account["name"], "title"))
+        names.addWidget(label(f"@{account['name']}", "small"))
+        top.addLayout(names, 1)
+        watch = QHBoxLayout()
+        watch.setSpacing(8)
+        watch.addWidget(label("Start watching", "small"))
+        self.watch = Toggle(account.get("watch", True))
+        self.watch.setToolTip("Once this account's Roblox window opens, start watching it")
+        self.watch.toggled.connect(lambda on: self.app.accounts.set_watch(self.user_id, on))
+        watch.addWidget(self.watch)
+        top.addLayout(watch)
+        self.remove_btn = button("", self._remove, "ghost", "trash", tip="Remove this account")
+        top.addWidget(self.remove_btn, 0, Qt.AlignTop)
+        col.addLayout(top)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.link = QLineEdit(account.get("link", ""))
+        self.link.setPlaceholderText("Private server link (roblox.com/share?code=…)")
+        self.link.addAction(icon("link", MUTED), QLineEdit.LeadingPosition)
+        self.link.textChanged.connect(lambda text: self.app.accounts.set_link(self.user_id, text.strip()))
+        self.link.returnPressed.connect(self._launch)
+        row.addWidget(self.link, 1)
+        self.launch_btn = button("Launch", self._launch, "primary", "play",
+                                 tip="Open Roblox as this account in the private server")
+        self.launch_btn.setStyleSheet("padding: 8px 16px; font-size: 13px;")
+        row.addWidget(self.launch_btn)
+        col.addLayout(row)
+        self.status = label("", "small", wrap=True)
+        col.addWidget(self.status)
+        self.show_status(*self.app.account_status.get(self.user_id, ("", MUTED)))
+        self._confirm = None
+
+    def load_avatar(self):
+        path = self.app.accounts.avatar_path(self.user_id)
+        if path.exists():
+            self.avatar.set_image(QImage(str(path)))
+
+    def show_status(self, text, color):
+        self.status.setText(text)
+        self.status.setStyleSheet(f"color:{color};")
+        self.status.setVisible(bool(text))
+
+    def _launch(self):
+        self.app._launch_accounts([self.user_id])
+
+    def _remove(self):
+        """First click asks; a second click within a few seconds removes the account."""
+        if self._confirm is None:
+            self.remove_btn.setText("Click again to remove")
+            self.remove_btn.setStyleSheet(f"color:{DANGER};")
+            self._confirm = QTimer(self)
+            self._confirm.setSingleShot(True)
+            self._confirm.timeout.connect(self._cancel_remove)
+            self._confirm.start(4000)
+            return
+        self._confirm.stop()
+        self.app._remove_account(self.user_id)
+
+    def _cancel_remove(self):
+        self._confirm = None
+        self.remove_btn.setText("")
+        self.remove_btn.setStyleSheet("")
+
+
+class AccountsDialog(Dialog):
+    """Saved Roblox accounts: add them (browser sign-in or cookie) and launch each into its
+    private server, in a Roblox window of its own."""
+
+    def __init__(self, app):
+        super().__init__(app, "Roblox accounts")
+        self.setMinimumSize(660, 640)
+        head = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(4)
+        titles.addWidget(label("Roblox accounts", "h2"))
+        titles.addWidget(label("Sign in once per account, then launch each one straight into its "
+                               "private server. Every launch opens its own Roblox window.",
+                               "muted", wrap=True))
+        head.addLayout(titles, 1)
+        self.multi = Pill("", GOOD, GOOD_SOFT)
+        head.addWidget(self.multi, 0, Qt.AlignTop)
+        self.body.addLayout(head)
+
+        add = QHBoxLayout()
+        add.setSpacing(8)
+        self.signin_btn = button("Sign in with browser", app._sign_in_browser, "primary", "log-in",
+                                 tip="Opens the Roblox login page in a small browser window")
+        add.addWidget(self.signin_btn)
+        self.cookie_btn = button("Add with cookie", self._toggle_cookie, icon_name="key",
+                                 tip="Paste an account's .ROBLOSECURITY cookie")
+        add.addWidget(self.cookie_btn)
+        add.addStretch(1)
+        self.body.addLayout(add)
+        self.note = label("", "small", wrap=True)
+        self.note.hide()
+        self.body.addWidget(self.note)
+
+        self.cookie_box, cookie_col = card((16, 12, 16, 12), 8)
+        crow = QHBoxLayout()
+        crow.setSpacing(8)
+        self.cookie_entry = QLineEdit()
+        self.cookie_entry.setEchoMode(QLineEdit.Password)
+        self.cookie_entry.setPlaceholderText(".ROBLOSECURITY cookie (_|WARNING:-DO-NOT-SHARE-THIS…)")
+        self.cookie_entry.addAction(icon("key", MUTED), QLineEdit.LeadingPosition)
+        self.cookie_entry.returnPressed.connect(self._add_cookie)
+        crow.addWidget(self.cookie_entry, 1)
+        crow.addWidget(button("Add", self._add_cookie))
+        cookie_col.addLayout(crow)
+        cookie_col.addWidget(label("Only paste your own cookie: anyone who has it is signed in as "
+                                   "you. It's saved encrypted, for this Windows user only.",
+                                   "small", wrap=True))
+        self.cookie_box.hide()
+        self.body.addWidget(self.cookie_box)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        self.list = QVBoxLayout(host)
+        self.list.setContentsMargins(0, 0, 4, 0)
+        self.list.setSpacing(10)
+        scroll.setWidget(host)
+        self.body.addWidget(scroll, 1)
+        self.rows = {}
+
+        bottom = QHBoxLayout()
+        self.launch_all_btn = button("Launch all", self._launch_all, icon_name="play",
+                                     tip="Launch every account that has a private server link")
+        bottom.addWidget(self.launch_all_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(button("Close", self.close))
+        self.body.addLayout(bottom)
+        self.show_multi()
+        self.rebuild()
+        if app.signin is not None:
+            self.show_note("Sign in in the browser window. It closes by itself once you're in.",
+                           MUTED)
+
+    def show_multi(self):
+        if self.app.multi_roblox:
+            self.multi.set("Multiple Roblox windows: on", GOOD, GOOD_SOFT)
+            self.multi.setToolTip("The app holds Roblox's one-window lock, so every Roblox you "
+                                  "open stays open next to the others.")
+        else:
+            self.multi.set("Multiple Roblox windows: shared", WARN, WARN_SOFT)
+            self.multi.setToolTip("Another multi-Roblox tool (like Roblox Account Manager) holds "
+                                  "Roblox's one-window lock, which works just as well while it's "
+                                  "open. The app takes the lock over as soon as it can.")
+
+    def show_note(self, text, color=MUTED):
+        self.note.setText(text)
+        self.note.setStyleSheet(f"color:{color};")
+        self.note.setVisible(bool(text))
+
+    def rebuild(self):
+        while self.list.count():
+            item = self.list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows = {}
+        for account in self.app.accounts.accounts:
+            row = AccountRow(self, account)
+            self.rows[account["id"]] = row
+            self.list.addWidget(row)
+        if not self.rows:
+            empty = label("No accounts yet. Sign in with the browser, or add one with its cookie.",
+                          "muted", wrap=True)
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setMinimumHeight(120)
+            self.list.addWidget(empty)
+        self.list.addStretch(1)
+        self.launch_all_btn.setEnabled(len(self.rows) > 1)
+        self.signin_btn.setEnabled(self.app.signin is None)
+
+    def _toggle_cookie(self):
+        self.cookie_box.setVisible(not self.cookie_box.isVisible())
+        if self.cookie_box.isVisible():
+            self.cookie_entry.setFocus()
+
+    def _add_cookie(self):
+        text = self.cookie_entry.text()
+        if text.strip():
+            self.cookie_entry.clear()
+            self.app._add_cookie(text)
+
+    def _launch_all(self):
+        ready = [a["id"] for a in self.app.accounts.accounts if a.get("link", "").strip()]
+        if not ready:
+            self.show_note("Paste a private server link into the accounts to launch first.", WARN)
+            return
+        self.app._launch_accounts(ready)
+
+
 class App(QMainWindow):
     def __init__(self, interval=1.0, debug=False, core_module=None):
         global core
@@ -1175,13 +1351,11 @@ class App(QMainWindow):
         self.session_anti_off = set()
         self.private_servers = core.load_private_servers()  # pid -> private server link
         self.popups = self.notifier = self.equipper = self.rebirther = None
-        self.rebirth_every = {}  # hwnd -> seconds between auto rebirth checks
         self.rebirth_on = {}  # hwnd -> auto rebirth switched on
         # Equip slots and auto rebirth start off at every launch; these keep them (by
         # Roblox process ID) only while the app is open, e.g. across Change windows.
         self.session_slots = {}
         self.session_rebirth = set()
-        self.session_rebirth_every = {}  # pid -> seconds; back to REBIRTH_EVERY every launch
         self.window_names = core.load_window_names()  # pid -> name the user gave the window
         self.names = {}  # hwnd -> name, read by the monitor thread for its messages
         self.default_names = {}
@@ -1194,12 +1368,32 @@ class App(QMainWindow):
         self.feed = None
         self.update_dialog = None
         self.update_state = None  # 'up_to_date' / 'available' / 'unknown' after a check
+        self.accounts = accounts.AccountStore(core.APP_DIR / "accounts.json")
+        self.accounts_dialog = None
+        self.account_status = {}  # user ID -> (text, colour) of its last launch
+        self.signin = None  # the open browser sign-in window (accounts.BrowserSignIn)
+        self.signin_thread = None
+        self.launch_queue = queue.Queue()  # (user ID, cookie, link, name) waiting to launch
+        self.launcher = None
+        self.watch_launched, self.auto_watch = {}, None  # launched windows to start watching
+        self.watch_timer = QTimer(self)
+        self.watch_timer.setSingleShot(True)
+        self.watch_timer.setInterval(1500)
+        self.watch_timer.timeout.connect(self._watch_launched)
+        # Own Roblox's one-window lock from the start, so every Roblox opened from now on
+        # (launched here or not) can run next to the others. Taking it from a Roblox that was
+        # open first takes a moment, so it runs off the UI thread, and is retried every few
+        # seconds until the app owns it (e.g. after another multi-Roblox tool closes).
+        self.multi_roblox = False
+        threading.Thread(target=self._keep_roblox_lock, daemon=True).start()
 
         self.setWindowTitle("Hallows' Eve Detector")
         if core.ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(core.ICON_PATH)))
         self.setMinimumSize(900, 620)
         self._build()
+        self._style_accounts()
+        self._toggle_trim()  # starts the RAM trim timer (switch is on by default)
         self._restore_geometry()
         self.show_picker()
         self.timer = QTimer(self)
@@ -1257,9 +1451,16 @@ class App(QMainWindow):
         head = QHBoxLayout()
         head.addWidget(label("WINDOWS", "section"))
         head.addStretch(1)
+        buttons = QVBoxLayout()
+        buttons.setSpacing(2)
         self.manage_btn = button("Manage", self.show_picker, "ghost", "grid",
                                  tip="Choose which Roblox windows to watch")
-        head.addWidget(self.manage_btn)
+        buttons.addWidget(self.manage_btn)
+        self.refresh_windows_btn = button("Refresh", self._refresh_windows, "ghost", "refresh",
+                                          tip="Look for Roblox windows again: watch new ones "
+                                              "too and drop closed ones")
+        buttons.addWidget(self.refresh_windows_btn)
+        head.addLayout(buttons)
         col.addLayout(head)
         col.addSpacing(6)
         self.nav_box = QVBoxLayout()
@@ -1268,6 +1469,24 @@ class App(QMainWindow):
         self.nav_empty = label("Pick the Roblox windows to watch.", "small", wrap=True)
         col.addWidget(self.nav_empty)
         col.addStretch(1)
+
+        accts = QFrame()
+        accts.setObjectName("stat")
+        arow = QHBoxLayout(accts)
+        arow.setContentsMargins(12, 10, 12, 10)
+        arow.setSpacing(10)
+        arow.addWidget(IconBadge("users", ACCENT, 30))
+        acol = QVBoxLayout()
+        acol.setSpacing(0)
+        acol.addWidget(label("Accounts", "title"))
+        self.accounts_sub = label("", "small")
+        acol.addWidget(self.accounts_sub)
+        arow.addLayout(acol, 1)
+        self.accounts_btn = button("Open", self._show_accounts,
+                                   tip="Sign in to Roblox accounts and launch them into servers")
+        arow.addWidget(self.accounts_btn)
+        col.addWidget(accts)
+        col.addSpacing(12)
 
         trim = QFrame()
         trim.setObjectName("stat")
@@ -1284,7 +1503,7 @@ class App(QMainWindow):
         self.trim_sub = label("Off", "small")
         tcol.addWidget(self.trim_sub)
         trow.addLayout(tcol, 1)
-        self.trim_toggle = Toggle(False)
+        self.trim_toggle = Toggle(True)  # on by default
         self.trim_toggle.clicked.connect(lambda *_: self._toggle_trim())
         trow.addWidget(self.trim_toggle)
         col.addWidget(trim)
@@ -1508,6 +1727,9 @@ class App(QMainWindow):
     def _show_windows(self, found):
         self.windows = found
         self.chosen = {hwnd: self.chosen.get(hwnd, True) for hwnd, *_ in found}
+        auto, self.auto_watch = self.auto_watch, None
+        if auto is not None:  # launched accounts' windows to watch (see _watch_launched)
+            self.chosen = {hwnd: pid in auto[0] for hwnd, pid, *_ in found}
         self.tiles = {}
         self.refresh_btn.setEnabled(True)
         if not found:
@@ -1525,6 +1747,10 @@ class App(QMainWindow):
         self.grid_columns = 0
         self._layout_tiles()
         self._update_start()
+        if auto is not None and any(self.chosen.values()):
+            self.start_watching()
+            if auto[1]:
+                self._log(auto[1])
 
     def _layout_tiles(self):
         """As many columns as fit (tiles at least ~300 px wide)."""
@@ -1629,13 +1855,11 @@ class App(QMainWindow):
             on_action=lambda ok, text: self.events.put(("rebirth", run, ok, text)),
             on_reading=lambda hwnd, text: self.events.put(("rebirth_reading", run, hwnd, text)))
         self.rebirther.on_stopped = lambda hwnd: self.events.put(("rebirth_stopped", run, hwnd))
-        self.rebirther.every = dict(self.rebirth_every)
         for hwnd, on in self.rebirth_on.items():
             self.rebirther.set_enabled(hwnd, on)
         if any(self.rebirth_on.values()):
             self._log("Auto rebirth on for " + ", ".join(
-                f"{self.rows[h]['label']} (every {core.duration(self.rebirth_every[h])})"
-                for h, on in self.rebirth_on.items() if on) + ".")
+                self.rows[h]['label'] for h, on in self.rebirth_on.items() if on) + ".")
         for hwnd, chosen in self.slots.items():
             self.equipper.set_slots(hwnd, chosen)
         if any(self.slots.values()):
@@ -1758,23 +1982,6 @@ class App(QMainWindow):
         rebirth_row = SettingRow("repeat", "Auto rebirth", "Rebirth whenever the cash covers it",
                                  rebirth)
         auto_col.addWidget(rebirth_row)
-        self.rebirth_every[hwnd] = self.session_rebirth_every.get(pid, core.REBIRTH_EVERY)
-        every = QHBoxLayout()
-        every.setContentsMargins(46, 0, 0, 0)
-        every.setSpacing(10)
-        every.addWidget(label("Check every", "small"))
-        stops = core.REBIRTH_INTERVALS
-        at = min(range(len(stops)), key=lambda i: abs(stops[i] - self.rebirth_every[hwnd]))
-        slider = StepSlider(len(stops), at)
-        slider.valueChanged.connect(lambda i, h=hwnd: self._set_rebirth_every(h, stops[i]))
-        slider.released.connect(lambda _i, h=hwnd: self._log(
-            f"{self.rows[h]['label']}: auto rebirth now checks every "
-            f"{core.duration(self.rebirth_every[h])}."))
-        every.addWidget(slider, 1)
-        every_label = label(core.duration(self.rebirth_every[hwnd]), "title")
-        every_label.setMinimumWidth(56)
-        every.addWidget(every_label)
-        auto_col.addLayout(every)
         info_row = QHBoxLayout()
         info_row.setContentsMargins(46, 6, 0, 0)
         rebirth_info = label("", "small", wrap=True)
@@ -1838,7 +2045,7 @@ class App(QMainWindow):
             "left": left, "caption": caption, "left_s": None, "image": image, "hide": hide,
             "live": live, "grid": grid, "auto": auto, "detect": detect, "detect_row": detect_row,
             "anti": anti, "anti_row": anti_row, "rebirth": rebirth, "rebirth_row": rebirth_row,
-            "slider": slider, "every_label": every_label, "rebirth_info": rebirth_info,
+            "rebirth_info": rebirth_info,
             "slot": slot, "strip": strip, "summary": summary, "warning": warning,
             "server_entry": server_entry, "server_hint": server_hint, "nav": nav, "wide": None}
 
@@ -2101,8 +2308,9 @@ class App(QMainWindow):
         self.rebirther.set_enabled(hwnd, on)
         (self.session_rebirth.add if on else self.session_rebirth.discard)(self.rows[hwnd]["pid"])
         name = self.rows[hwnd]["label"]
-        self._log(f"{name}: auto rebirth on (checks every {core.duration(self.rebirth_every[hwnd])} "
-                  "and rebirths when the cash covers it)." if on else f"{name}: auto rebirth off.")
+        self._log(f"{name}: auto rebirth on (reads the cost, then compares the cash every "
+                  f"{core.REBIRTH_EVERY:.0f} s and rebirths once it covers it)." if on
+                  else f"{name}: auto rebirth off.")
         self._style_rebirth(hwnd)
 
     def _style_rebirth(self, hwnd):
@@ -2112,14 +2320,6 @@ class App(QMainWindow):
         widgets["rebirth_row"].set_on(on)
         if not on:
             widgets["rebirth_info"].setText("")
-
-    def _set_rebirth_every(self, hwnd, seconds):
-        self.rebirth_every[hwnd] = float(seconds)
-        if hwnd in self.rows:
-            self.session_rebirth_every[self.rows[hwnd]["pid"]] = float(seconds)
-            self.rows[hwnd]["every_label"].setText(core.duration(seconds))
-        if self.rebirther:
-            self.rebirther.every[hwnd] = float(seconds)
 
     def _show_rebirth_log(self, hwnd):
         window = self.log_windows.get(hwnd)
@@ -2195,6 +2395,287 @@ class App(QMainWindow):
         role = self.notifier.role_label or f"@{self.notifier.role}"
         self.discord_sub.setText(f"Pings {role}" if self.discord_on else "Paused")
         self.discord_badge.set_color(ACCENT if self.discord_on else MUTED)
+
+    # ------------------------------------------------------------------ accounts
+
+    def _style_accounts(self):
+        count = len(self.accounts.accounts)
+        self.accounts_sub.setText(f"{core.plural(count, 'account')} saved" if count
+                                  else "Sign in and launch")
+
+    def _accounts_window(self):
+        """The open AccountsDialog, or None."""
+        try:
+            if self.accounts_dialog is not None and self.accounts_dialog.isVisible():
+                return self.accounts_dialog
+        except RuntimeError:
+            pass
+        return None
+
+    def _show_accounts(self):
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        self.accounts_dialog = AccountsDialog(self)
+        self.accounts_dialog.destroyed.connect(lambda *_: setattr(self, "accounts_dialog", None))
+        self.accounts_dialog.show_centred()
+        missing = [a["id"] for a in self.accounts.accounts
+                   if not self.accounts.avatar_path(a["id"]).exists()]
+        if missing:
+            self._fetch_avatars(missing)
+
+    def _account_note(self, text, color=MUTED):
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.show_note(text, color)
+
+    def _set_account_status(self, user_id, text, color=MUTED):
+        self.account_status[user_id] = (text, color)
+        dialog = self._accounts_window()
+        if dialog is not None and user_id in dialog.rows:
+            dialog.rows[user_id].show_status(text, color)
+
+    def _sign_in_browser(self):
+        """Open the Roblox login page in a browser window of its own; the account is saved
+        once the sign-in goes through (an 'acct_signed_in' event)."""
+        if self.signin is not None:
+            self._account_note("The sign-in window is already open.")
+            return
+        signin = accounts.BrowserSignIn()
+        try:
+            signin.start()
+        except (accounts.AccountError, OSError) as e:
+            self._account_note(str(e), DANGER)
+            return
+        self.signin = signin
+        self._account_note("Sign in in the browser window. It closes by itself once you're in.")
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.signin_btn.setEnabled(False)
+
+        def work():
+            try:
+                cookie = signin.wait(timeout=15 * 60)
+                if cookie:
+                    self.events.put(("acct_signed_in", None, cookie, signin.info))
+                else:
+                    self.events.put(("acct_signin_closed", None))
+            except Exception as e:
+                self.events.put(("acct_signin_closed", None))
+                self.events.put(("acct_note", None, f"Sign-in stopped: {e}", DANGER))
+
+        self.signin_thread = threading.Thread(target=work, daemon=True)
+        self.signin_thread.start()
+
+    def _add_cookie(self, text):
+        cookie = accounts.clean_cookie(text)
+        self._account_note("Checking the cookie with Roblox…")
+
+        def work():
+            try:
+                self.events.put(("acct_signed_in", None, cookie, accounts.who_is(cookie)))
+            except accounts.AccountError as e:
+                self.events.put(("acct_note", None, f"That cookie didn't work: {e}", DANGER))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _account_added(self, cookie, info):
+        account, new = self.accounts.add(info, cookie)
+        name = account.get("display") or account["name"]
+        self._account_note((f"Added {name} (@{account['name']})." if new
+                            else f"Signed in again as {name} (@{account['name']})."), GOOD)
+        self._log(f"Accounts: {'added' if new else 'renewed the sign-in for'} @{account['name']}.")
+        self._style_accounts()
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.rebuild()
+        self._fetch_avatars([account["id"]])
+
+    def _fetch_avatars(self, user_ids):
+        def work():
+            for user_id in user_ids:
+                if accounts.fetch_avatar(user_id, self.accounts.avatar_path(user_id)):
+                    self.events.put(("acct_avatar", None, user_id))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _remove_account(self, user_id):
+        account = self.accounts.get(user_id)
+        if account is None:
+            return
+        self.accounts.remove(user_id)
+        self.account_status.pop(user_id, None)
+        self._log(f"Accounts: removed @{account['name']}.")
+        self._account_note(f"Removed @{account['name']}.")
+        self._style_accounts()
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.rebuild()
+
+    def _launch_accounts(self, user_ids):
+        """Queue launches; they run one after another, each waiting for its Roblox window so
+        the window can be told apart from the others (and given the account's name and its
+        private server link)."""
+        for user_id in user_ids:
+            account = self.accounts.get(user_id)
+            if account is None:
+                continue
+            link = account.get("link", "").strip()
+            try:
+                accounts.parse_server_link(link)
+                cookie = self.accounts.cookie(account)
+            except accounts.AccountError as e:
+                self._set_account_status(user_id, str(e), DANGER)
+                continue
+            self._set_account_status(user_id, "Waiting for the launch before it…"
+                                     if self.launch_queue.unfinished_tasks else "Starting…")
+            self.launch_queue.put((user_id, cookie, link, account["name"]))
+        if self.launcher is None:
+            self.launcher = threading.Thread(target=self._launch_worker, daemon=True)
+            self.launcher.start()
+
+    def _launch_worker(self):
+        while True:
+            user_id, cookie, link, name = self.launch_queue.get()
+            try:
+                def post(text, color=MUTED):
+                    self.events.put(("acct_status", None, user_id, text, color))
+
+                accounts.allow_multiple_roblox()  # quick once the app owns the lock
+                before = {pid for _, pid, _ in core.find_roblox_windows()}
+                accounts.launch(cookie, link, progress=post)
+                post("Waiting for the Roblox window…")
+                pid, end = None, time.monotonic() + accounts.WINDOW_WAIT
+                while pid is None and time.monotonic() < end:
+                    time.sleep(1)
+                    pid = next((p for _, p, _ in core.find_roblox_windows() if p not in before), None)
+                self.events.put(("acct_window", None, user_id, name, link, pid))
+            except accounts.AccountError as e:
+                post(str(e), DANGER)
+            except Exception as e:  # never let one launch stop the ones after it
+                post(f"Unexpected problem: {e}", DANGER)
+            finally:
+                self.launch_queue.task_done()
+
+    def _account_window(self, user_id, name, link, pid):
+        """A launched account's Roblox window showed up: name it after the account and give
+        it the account's private server link (for the Discord ping)."""
+        if pid is None:
+            self._set_account_status(user_id, f"Roblox was started, but no new window showed up "
+                                     f"within {accounts.WINDOW_WAIT} s.", WARN)
+            return
+        self.private_servers[pid] = link
+        core.save_private_servers(self.private_servers)
+        if pid not in self.window_names:
+            self.window_names[pid] = core.clean_window_name(name)
+            core.save_window_names(self.window_names)
+        self._set_account_status(user_id, f"Opened at {time.strftime('%H:%M')} · PID {pid}", GOOD)
+        account = self.accounts.get(user_id)
+        watch = account is not None and account.get("watch", True)
+        self._log(f"Accounts: launched @{name} into its server (PID {pid})."
+                  + (" Use Manage to watch the new window." if self.rows and not watch else ""))
+        if watch:
+            self.watch_launched[pid] = name
+            self.watch_timer.start()
+        elif not self.rows and hasattr(self, "refresh_btn"):  # the window picker is open
+            try:
+                self.refresh()
+            except RuntimeError:
+                pass
+
+    def _refresh_windows(self):
+        """Look for Roblox windows again. While watching: keep watching the same windows,
+        add ones opened since they were picked, and drop ones that closed. On the picker:
+        scan again."""
+        if not self.rows:
+            if hasattr(self, "refresh_btn"):
+                try:
+                    self.refresh()
+                    return
+                except RuntimeError:
+                    pass
+            self.show_picker()
+            return
+        alive = {pid for _, pid, _ in core.find_roblox_windows()}
+        watched = {w["pid"] for w in self.rows.values()}
+        known = {pid for _, pid, _, _ in self.windows}
+        new, closed = alive - known - watched, watched - alive
+        if not new and not closed:
+            self._log("Refresh: no new or closed Roblox windows.")
+            return
+        parts = []
+        if new:
+            parts.append(f"watching {core.plural(len(new), 'new window')}")
+        if closed:
+            parts.append(f"dropped {core.plural(len(closed), 'closed window')}")
+        if not (watched & alive) | new:
+            self.show_picker()
+            return
+        self.auto_watch = ((watched & alive) | new, "Refresh: " + ", ".join(parts) + ".")
+        self.show_picker()
+
+    def _watch_launched(self):
+        """Start watching the windows of launched accounts (with the windows already being
+        watched). Waits until queued launches are done, so Launch all restarts watching once."""
+        if self.launch_queue.unfinished_tasks:
+            self.watch_timer.start()
+            return
+        alive = {pid for _, pid, _ in core.find_roblox_windows()}
+        new = {pid: name for pid, name in self.watch_launched.items() if pid in alive}
+        self.watch_launched = {}
+        if not new:
+            return
+        # Keep what's watched now; from the picker, keep what's picked there.
+        keep = ({w["pid"] for w in self.rows.values()} if self.rows
+                else {pid for hwnd, pid, _, _ in getattr(self, "windows", [])
+                      if self.chosen.get(hwnd)} if hasattr(self, "refresh_btn") else set())
+        self.auto_watch = (keep | set(new), "Accounts: watching " + ", ".join(
+            f"@{n}" for n in new.values()) + "'s new window" + ("s" if len(new) > 1 else "") + " too.")
+        if self.rows or not hasattr(self, "refresh_btn"):
+            self.show_picker()  # stops watching and scans; _show_windows starts again
+        else:
+            try:
+                self.refresh()
+            except RuntimeError:
+                self.show_picker()
+
+    def _keep_roblox_lock(self):
+        while True:
+            try:
+                owned = accounts.allow_multiple_roblox()
+            except Exception:
+                owned = False
+            if owned != self.multi_roblox:
+                self.events.put(("acct_multi", None, owned))
+            time.sleep(5)
+
+    def _account_event(self, kind, data):
+        if kind == "acct_multi":
+            self.multi_roblox = data[0]
+            dialog = self._accounts_window()
+            if dialog is not None:
+                dialog.show_multi()
+        elif kind == "acct_status":
+            self._set_account_status(*data)
+        elif kind == "acct_window":
+            self._account_window(*data)
+        elif kind == "acct_note":
+            self._account_note(*data)
+        elif kind == "acct_signed_in":
+            self._account_added(*data)
+        elif kind == "acct_signin_closed":
+            self.signin = None
+            dialog = self._accounts_window()
+            if dialog is not None:
+                dialog.signin_btn.setEnabled(True)
+                if dialog.note.text().startswith("Sign in in the browser"):
+                    dialog.show_note("The sign-in window was closed before signing in.")
+        elif kind == "acct_avatar":
+            dialog = self._accounts_window()
+            if dialog is not None and data[0] in dialog.rows:
+                dialog.rows[data[0]].load_avatar()
 
     # ------------------------------------------------------------------ RAM trim
 
@@ -2341,6 +2822,14 @@ class App(QMainWindow):
                 if kind == "trim_done":
                     self._trim_done(*data)
                     continue
+                if kind.startswith("acct_"):
+                    if kind == "acct_signed_in":
+                        self.signin = None
+                        dialog = self._accounts_window()
+                        if dialog is not None:
+                            dialog.signin_btn.setEnabled(True)
+                    self._account_event(kind, data)
+                    continue
                 if run != self.run_id:
                     continue
                 if kind == "windows":
@@ -2393,11 +2882,16 @@ class App(QMainWindow):
         self._save_geometry()
         self._close_slot_picker()
         self._close_log_windows()
-        try:
-            if self.update_dialog is not None:
-                self.update_dialog.close()
-        except RuntimeError:
-            pass
+        for dialog in (self.update_dialog, self.accounts_dialog):
+            try:
+                if dialog is not None:
+                    dialog.close()
+            except RuntimeError:
+                pass
+        if self.signin is not None:  # shut the sign-in browser and delete its profile
+            self.signin.cancel()
+            if self.signin_thread is not None:
+                self.signin_thread.join(8)
         self._stop_watching()
         core.show_all_hidden()
 

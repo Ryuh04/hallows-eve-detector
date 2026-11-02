@@ -44,7 +44,7 @@ STATE_PATH = APP_DIR / "installed_version.json"
 # in the repository anyway; this is a second line of defence).
 KEEP = {"discord_config.json", "private_servers.json", "window_names.json", "rebirth_log.csv",
         "ui_settings.json", "hotbar_slots.json", "auto_rebirth.json", "hidden_windows.json",
-        "installed_version.json", "detector_output.log"}
+        "installed_version.json", "detector_output.log", "accounts.json"}
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: run pip without flashing a console
 
 

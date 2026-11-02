@@ -1,0 +1,694 @@
+"""
+Roblox accounts: sign in once per account, then launch Roblox with it straight into a
+private server, as many windows at once as you like.
+
+- Sign-ins are kept as the account's .ROBLOSECURITY cookie, encrypted with Windows
+  (DPAPI), so accounts.json is useless on any other PC or Windows user. The cookie is
+  never printed or logged.
+- Signing in happens in a small Edge (or Chrome) window with its own empty profile; the
+  cookie is read from it through the browser's DevTools port once Roblox sets it. The
+  password is typed into roblox.com only.
+- Launching asks Roblox for a one-time join ticket and opens the roblox-player: link,
+  the same thing the Play button on the website does.
+- Multiple Roblox windows: Roblox closes extra copies of itself unless its single-
+  instance mutex already exists, so the app holds it while it's open.
+"""
+
+import base64
+import ctypes
+import ctypes.wintypes as wt
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+LOGIN_URL = "https://www.roblox.com/login"
+COOKIE_NAME = ".ROBLOSECURITY"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+WINDOW_WAIT = 90  # seconds to wait for a launched Roblox window to appear
+
+
+class AccountError(Exception):
+    """Something went wrong with an account; the text is shown to the user as it is."""
+
+
+# --------------------------------------------------------------------------- #
+# Windows DPAPI: encrypt the cookie for this Windows user only
+# --------------------------------------------------------------------------- #
+
+class _Blob(ctypes.Structure):
+    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+_crypt32 = ctypes.WinDLL("crypt32")
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_crypt32.CryptProtectData.argtypes = [ctypes.POINTER(_Blob), wt.LPCWSTR, ctypes.POINTER(_Blob),
+                                      ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
+                                      ctypes.POINTER(_Blob)]
+_crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(_Blob), ctypes.c_void_p,
+                                        ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.c_void_p,
+                                        wt.DWORD, ctypes.POINTER(_Blob)]
+_kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+_UI_FORBIDDEN = 0x1
+_ENTROPY = b"HallowsEveDetector accounts"
+
+
+def _dpapi(data, protect):
+    source = _Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)),
+                                          ctypes.POINTER(ctypes.c_char)))
+    entropy = _Blob(len(_ENTROPY), ctypes.cast(ctypes.create_string_buffer(_ENTROPY, len(_ENTROPY)),
+                                               ctypes.POINTER(ctypes.c_char)))
+    out = _Blob()
+    if protect:
+        ok = _crypt32.CryptProtectData(ctypes.byref(source), None, ctypes.byref(entropy), None,
+                                       None, _UI_FORBIDDEN, ctypes.byref(out))
+    else:
+        ok = _crypt32.CryptUnprotectData(ctypes.byref(source), None, ctypes.byref(entropy), None,
+                                         None, _UI_FORBIDDEN, ctypes.byref(out))
+    if not ok:
+        raise AccountError("Windows couldn't unlock this saved sign-in (was it saved by another "
+                           "Windows user?). Sign in again.")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        _kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def protect(text):
+    return base64.b64encode(_dpapi(text.encode(), True)).decode()
+
+
+def unprotect(blob):
+    return _dpapi(base64.b64decode(blob), False).decode()
+
+
+def clean_cookie(text):
+    """A pasted cookie without the bits people copy along with it (name=, quotes, spaces)."""
+    text = text.strip().strip('"').strip("'").strip()
+    if text.lower().startswith(COOKIE_NAME.lower() + "="):
+        text = text[len(COOKIE_NAME) + 1:]
+    return text.strip().rstrip(";").strip()
+
+
+# --------------------------------------------------------------------------- #
+# Talking to Roblox
+# --------------------------------------------------------------------------- #
+
+class RobloxSession:
+    """Requests to Roblox's web API as one account. Handles the CSRF token Roblox asks for
+    on POSTs (the first one is refused with a token to use; it's then sent again)."""
+
+    def __init__(self, cookie, opener=None):
+        self.cookie = cookie
+        self.csrf = ""
+        self.open = opener or urllib.request.urlopen
+
+    def call(self, method, url, body=None, headers=None):
+        """(status, response headers, parsed JSON or raw bytes)."""
+        for attempt in range(2):
+            sent = {"Cookie": f"{COOKIE_NAME}={self.cookie}", "User-Agent": USER_AGENT,
+                    "Referer": "https://www.roblox.com/", "Origin": "https://www.roblox.com",
+                    "Accept": "application/json"}
+            data = None
+            if method != "GET":
+                sent["X-CSRF-TOKEN"] = self.csrf
+                sent["Content-Type"] = "application/json"
+                data = json.dumps(body if body is not None else {}).encode()
+            sent.update(headers or {})
+            request = urllib.request.Request(url, data=data, headers=sent, method=method)
+            try:
+                with self.open(request, timeout=20) as response:
+                    raw = response.read()
+                    try:
+                        parsed = json.loads(raw) if raw else {}
+                    except ValueError:
+                        parsed = raw
+                    return response.status, response.headers, parsed
+            except urllib.error.HTTPError as e:
+                token = e.headers.get("x-csrf-token") if e.headers else None
+                if e.code == 403 and token and attempt == 0:
+                    self.csrf = token
+                    continue
+                if e.code == 401:
+                    raise AccountError("This account is signed out (the saved sign-in expired). "
+                                       "Sign in again.") from None
+                if e.code == 429:
+                    raise AccountError("Roblox says too many requests; wait a minute and try "
+                                       "again.") from None
+                raise AccountError(f"Roblox refused the request ({e.code}).") from None
+            except (urllib.error.URLError, OSError) as e:
+                raise AccountError(f"Couldn't reach Roblox ({getattr(e, 'reason', e)}).") from None
+        raise AccountError("Roblox kept refusing the request (security token).")
+
+
+def who_is(cookie, opener=None):
+    """{'id', 'name', 'display'} of the account a cookie signs in to."""
+    _, _, data = RobloxSession(cookie, opener).call(
+        "GET", "https://users.roblox.com/v1/users/authenticated")
+    if not isinstance(data, dict) or "id" not in data:
+        raise AccountError("Roblox didn't accept that sign-in.")
+    return {"id": int(data["id"]), "name": str(data.get("name", "")),
+            "display": str(data.get("displayName") or data.get("name", ""))}
+
+
+def parse_server_link(link):
+    """What a pasted link points at:
+    {'share': code}                      roblox.com/share?code=…&type=Server
+    {'place_id': n, 'link_code': code}   roblox.com/games/n/…?privateServerLinkCode=…
+    {'place_id': n, 'link_code': None}   roblox.com/games/n/… (a public server)"""
+    text = (link or "").strip()
+    if not text:
+        raise AccountError("Paste a private server link first.")
+    if "://" not in text:
+        text = "https://" + text
+    parts = urllib.parse.urlparse(text)
+    host = parts.netloc.lower().split(":")[0]
+    if not (host == "roblox.com" or host.endswith(".roblox.com")):
+        raise AccountError("That isn't a roblox.com link.")
+    query = urllib.parse.parse_qs(parts.query)
+    if parts.path.rstrip("/").lower().endswith("/share") and query.get("code"):
+        kind = (query.get("type") or ["Server"])[0]
+        if kind.lower() != "server":
+            raise AccountError(f"That share link is for a {kind}, not a server.")
+        return {"share": query["code"][0]}
+    match = re.search(r"/games/(\d+)", parts.path, re.IGNORECASE)
+    if match:
+        code = (query.get("privateServerLinkCode") or [None])[0]
+        return {"place_id": int(match.group(1)), "link_code": code}
+    raise AccountError("That link isn't a Roblox server or game link.")
+
+
+def resolve_share(session, code):
+    """(place ID, private server link code) behind a roblox.com/share?code=… link."""
+    _, _, data = session.call("POST", "https://apis.roblox.com/sharelinks/v1/resolve-link",
+                              {"linkId": code, "linkType": "Server"})
+    invite = data.get("privateServerInviteData") if isinstance(data, dict) else None
+    if not invite or not invite.get("placeId"):
+        raise AccountError("Roblox didn't recognise that private server link.")
+    status = str(invite.get("status", "Valid"))
+    if status.lower() != "valid":
+        raise AccountError(f"That private server link isn't usable ({status}); it may have "
+                           "expired or been reset.")
+    return int(invite["placeId"]), invite.get("linkCode")
+
+
+def auth_ticket(session):
+    """A one-time ticket that lets the Roblox player sign in as this account."""
+    _, headers, _ = session.call("POST", "https://auth.roblox.com/v1/authentication-ticket/",
+                                 headers={"RBXAuthenticationNegotiation": "1"})
+    ticket = headers.get("rbx-authentication-ticket") if headers else None
+    if not ticket:
+        raise AccountError("Roblox didn't hand out a join ticket.")
+    return ticket
+
+
+def launch_uri(ticket, place_id, link_code=None, tracker=None):
+    """The roblox-player: link that starts Roblox signed in and joins the place (the private
+    server, when there's a link code)."""
+    tracker = tracker or random.randint(10 ** 11, 10 ** 12 - 1)
+    if link_code:
+        launcher = (f"https://www.roblox.com/Game/PlaceLauncher.ashx?request=RequestPrivateGame"
+                    f"&browserTrackerId={tracker}&placeId={place_id}&linkCode={link_code}")
+    else:
+        launcher = (f"https://www.roblox.com/Game/PlaceLauncher.ashx?request=RequestGame"
+                    f"&browserTrackerId={tracker}&placeId={place_id}&isPlayTogetherGame=false")
+    return ("roblox-player:1+launchmode:play+gameinfo:" + ticket
+            + f"+launchtime:{int(time.time() * 1000)}"
+            + "+placelauncherurl:" + urllib.parse.quote(launcher, safe="")
+            + f"+browsertrackerid:{tracker}+robloxLocale:en_us+gameLocale:en_us+channel:"
+            + "+LaunchExp:InApp")
+
+
+def launch(cookie, link, progress=lambda text: None, opener=None, start=None):
+    """Start Roblox as this account, joining the server the link points at."""
+    target = parse_server_link(link)
+    session = RobloxSession(cookie, opener)
+    if "share" in target:
+        progress("Reading the private server link…")
+        place_id, link_code = resolve_share(session, target["share"])
+    else:
+        place_id, link_code = target["place_id"], target["link_code"]
+    progress("Getting a join ticket…")
+    uri = launch_uri(auth_ticket(session), place_id, link_code)
+    progress("Starting Roblox…")
+    try:
+        (start or os.startfile)(uri)
+    except OSError as e:
+        raise AccountError(f"Windows couldn't start Roblox ({e.strerror or e}). Is Roblox "
+                           "installed?") from None
+
+
+def fetch_avatar(user_id, path, opener=None):
+    """Save the account's avatar headshot as a PNG; False if Roblox has none to give."""
+    get = opener or urllib.request.urlopen
+    url = (f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}"
+           "&size=150x150&format=Png&isCircular=false")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with get(request, timeout=20) as response:
+            data = json.loads(response.read())
+        image_url = (data.get("data") or [{}])[0].get("imageUrl")
+        if not image_url:
+            return False
+        with get(urllib.request.Request(image_url, headers={"User-Agent": USER_AGENT}),
+                 timeout=20) as response:
+            png = response.read()
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png)
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Saved accounts
+# --------------------------------------------------------------------------- #
+
+class AccountStore:
+    """accounts.json: [{'id', 'name', 'display', 'cookie' (encrypted), 'link', 'watch', 'added'}].
+    Only used from the UI thread."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.avatar_dir = self.path.parent / "avatars"
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.accounts = [a for a in data.get("accounts", []) if "id" in a and "cookie" in a]
+        except (OSError, ValueError, AttributeError):
+            self.accounts = []
+
+    def save(self):
+        temp = self.path.with_name(self.path.name + ".tmp")
+        temp.write_text(json.dumps({"accounts": self.accounts}, indent=1), encoding="utf-8")
+        os.replace(temp, self.path)
+
+    def get(self, user_id):
+        return next((a for a in self.accounts if a["id"] == user_id), None)
+
+    def add(self, info, cookie, link=""):
+        """Save a checked sign-in ({'id', 'name', 'display'} from who_is). Signing in to an
+        account that's already there just renews its sign-in. Returns (account, new)."""
+        account = self.get(info["id"])
+        new = account is None
+        if new:
+            account = {"id": info["id"], "link": link, "added": time.strftime("%Y-%m-%d %H:%M")}
+            self.accounts.append(account)
+        account.update(name=info["name"], display=info["display"], cookie=protect(cookie))
+        self.save()
+        return account, new
+
+    def cookie(self, account):
+        return unprotect(account["cookie"])
+
+    def set_link(self, user_id, link):
+        account = self.get(user_id)
+        if account is not None and account.get("link", "") != link:
+            account["link"] = link
+            self.save()
+
+    def set_watch(self, user_id, on):
+        """Whether the app starts watching this account's Roblox window once it's launched."""
+        account = self.get(user_id)
+        if account is not None and account.get("watch", True) != on:
+            account["watch"] = on
+            self.save()
+
+    def remove(self, user_id):
+        self.accounts = [a for a in self.accounts if a["id"] != user_id]
+        self.save()
+        try:
+            self.avatar_path(user_id).unlink()
+        except OSError:
+            pass
+
+    def avatar_path(self, user_id):
+        return self.avatar_dir / f"{user_id}.png"
+
+
+# --------------------------------------------------------------------------- #
+# More than one Roblox window
+# --------------------------------------------------------------------------- #
+
+_kernel32.CreateMutexW.restype = wt.HANDLE
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+_kernel32.CreateEventW.restype = wt.HANDLE
+_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.BOOL, wt.LPCWSTR]
+_kernel32.OpenProcess.restype = wt.HANDLE
+_kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_kernel32.GetCurrentProcess.restype = wt.HANDLE
+_kernel32.DuplicateHandle.argtypes = [wt.HANDLE, wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.HANDLE),
+                                      wt.DWORD, wt.BOOL, wt.DWORD]
+_kernel32.CloseHandle.argtypes = [wt.HANDLE]
+_ntdll = ctypes.WinDLL("ntdll")
+_ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+                                            ctypes.POINTER(wt.ULONG)]
+_ntdll.NtQueryObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+                                 ctypes.POINTER(wt.ULONG)]
+_held = []
+_lock = threading.Lock()
+ERROR_ALREADY_EXISTS = 183
+SINGLETON_NAMES = ("ROBLOX_singletonMutex", "ROBLOX_singletonEvent")
+
+
+class _HandleEntry(ctypes.Structure):  # SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX
+    _fields_ = [("Object", ctypes.c_void_p), ("UniqueProcessId", ctypes.c_size_t),
+                ("HandleValue", ctypes.c_size_t), ("GrantedAccess", wt.ULONG),
+                ("CreatorBackTraceIndex", wt.USHORT), ("ObjectTypeIndex", wt.USHORT),
+                ("HandleAttributes", wt.ULONG), ("Reserved", wt.ULONG)]
+
+
+def _roblox_pids():
+    out = subprocess.run(["tasklist", "/fi", "imagename eq RobloxPlayerBeta.exe", "/fo", "csv", "/nh"],
+                         capture_output=True, text=True, creationflags=0x08000000).stdout
+    pids = set()
+    for line in out.splitlines():
+        parts = line.strip().strip('"').split('","')
+        if len(parts) > 1 and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+def _object_text(handle, info_class):
+    """An object's type (info_class 2) or name (1). Names are only asked for mutexes and
+    events: asking a pipe's name can hang."""
+    buf = ctypes.create_string_buffer(4096)
+    if _ntdll.NtQueryObject(handle, info_class, buf, 4096, None) != 0:
+        return None
+    length = ctypes.c_ushort.from_buffer(buf).value
+    ptr = ctypes.c_void_p.from_buffer(buf, 8).value
+    return ctypes.wstring_at(ptr, length // 2) if ptr else ""
+
+
+def close_roblox_singletons():
+    """Close Roblox's single-instance mutex and event inside the running Roblox clients
+    (what Roblox Account Manager does), so the app can own them. Returns how many it closed."""
+    pids = _roblox_pids()
+    if not pids:
+        return 0
+    size = 1 << 22
+    while True:
+        buf = ctypes.create_string_buffer(size)
+        needed = wt.ULONG()
+        status = _ntdll.NtQuerySystemInformation(64, buf, size, ctypes.byref(needed)) & 0xFFFFFFFF
+        if status == 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH
+            size = max(size * 2, needed.value + (1 << 16))
+            continue
+        if status != 0:
+            return 0
+        break
+    count = ctypes.c_size_t.from_buffer(buf).value
+    entries = (_HandleEntry * count).from_buffer(buf, 2 * ctypes.sizeof(ctypes.c_size_t))
+    me, closed, types = _kernel32.GetCurrentProcess(), 0, {}
+    procs = {pid: _kernel32.OpenProcess(0x0040, False, pid) for pid in pids}  # PROCESS_DUP_HANDLE
+    try:
+        for entry in entries:
+            proc = procs.get(entry.UniqueProcessId)
+            if not proc or types.get(entry.ObjectTypeIndex, "Mutant") not in ("Mutant", "Event"):
+                continue
+            dup = wt.HANDLE()
+            if not _kernel32.DuplicateHandle(proc, entry.HandleValue, me, ctypes.byref(dup), 0,
+                                             False, 2):  # DUPLICATE_SAME_ACCESS
+                continue
+            kind = types.setdefault(entry.ObjectTypeIndex, _object_text(dup, 2))
+            name = _object_text(dup, 1) if kind in ("Mutant", "Event") else None
+            _kernel32.CloseHandle(dup)
+            if name and name.rsplit("\\", 1)[-1] in SINGLETON_NAMES:
+                if _kernel32.DuplicateHandle(proc, entry.HandleValue, None, None, 0, False,
+                                             1):  # DUPLICATE_CLOSE_SOURCE
+                    closed += 1
+    finally:
+        for proc in procs.values():
+            if proc:
+                _kernel32.CloseHandle(proc)
+    return closed
+
+
+def _take_roblox_lock():
+    """One try at owning the mutex and event (on the keeper thread). True once owned."""
+    if _held and _held[0][1]:
+        return True
+    for handle, _ in _held:
+        _kernel32.CloseHandle(handle)
+    _held.clear()
+    made = False
+    for attempt in range(2):
+        handle = _kernel32.CreateMutexW(None, True, SINGLETON_NAMES[0])
+        made = ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+        if made or attempt or not handle:
+            break
+        _kernel32.CloseHandle(handle)  # someone else's: close theirs in Roblox, try again
+        if not close_roblox_singletons():
+            handle = _kernel32.CreateMutexW(None, True, SINGLETON_NAMES[0])
+            break
+    event = _kernel32.CreateEventW(None, True, False, SINGLETON_NAMES[1])
+    if handle:
+        _held.append((handle, made))
+    if event:
+        _held.append((event, made))
+    return made
+
+
+def _keep_roblox_lock(first_try):
+    """The thread that owns the mutex. It never ends: a mutex whose owning thread ends is
+    'abandoned', and the next Roblox to wait for it takes it over and closes the others."""
+    while True:
+        with _lock:
+            owned = _take_roblox_lock()
+        first_try.set()
+        if not owned:
+            time.sleep(5)  # another tool holds it; take over once it lets go
+            continue
+        time.sleep(3600)
+
+
+_keeper = None
+
+
+def allow_multiple_roblox(wait=10):
+    """Own Roblox's single-instance mutex (and event) for as long as the app runs, so every
+    Roblox opened from then on stays open next to the others. If a Roblox that was open
+    before the app owns them, its handles are closed first so the app can take them over.
+    The lock is held by a thread of its own that lives as long as the app. True once the app
+    owns it; False if something else still does (another multi-Roblox tool, which works just
+    as well; the app keeps trying every few seconds). Safe to call again."""
+    global _keeper
+    if _keeper is None:
+        first_try = threading.Event()
+        _keeper = threading.Thread(target=_keep_roblox_lock, args=(first_try,), daemon=True,
+                                   name="roblox-lock")
+        _keeper.start()
+        first_try.wait(wait)
+    with _lock:
+        return bool(_held and _held[0][1])
+
+
+# --------------------------------------------------------------------------- #
+# Signing in through a browser window
+# --------------------------------------------------------------------------- #
+
+def find_browser():
+    """Edge (on every Windows 10/11 PC) or else Chrome; None if neither is installed."""
+    roots = [os.environ.get(k) for k in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA")]
+    for relative in (r"Microsoft\Edge\Application\msedge.exe",
+                     r"Google\Chrome\Application\chrome.exe"):
+        for root in roots:
+            if root and (Path(root) / relative).exists():
+                return Path(root) / relative
+    return None
+
+
+class _WebSocket:
+    """Just enough of a WebSocket client to talk to a local browser's DevTools port."""
+
+    def __init__(self, port, path, timeout=5):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("the browser closed the connection")
+            reply += chunk
+        head, self.buffer = reply.split(b"\r\n\r\n", 1)
+        if b" 101" not in head.split(b"\r\n")[0]:
+            raise OSError("the browser refused the connection")
+        self.next_id = 0
+
+    def _read(self, n):
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise OSError("the browser closed the connection")
+            self.buffer += chunk
+        data, self.buffer = self.buffer[:n], self.buffer[n:]
+        return data
+
+    def send(self, text):
+        data, mask = text.encode(), os.urandom(4)
+        header = bytearray([0x81])
+        if len(data) < 126:
+            header.append(0x80 | len(data))
+        elif len(data) < 65536:
+            header += bytes([0x80 | 126]) + len(data).to_bytes(2, "big")
+        else:
+            header += bytes([0x80 | 127]) + len(data).to_bytes(8, "big")
+        self.sock.sendall(bytes(header) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def receive(self):
+        message = b""
+        while True:
+            first, second = self._read(2)
+            size = second & 0x7F
+            if size == 126:
+                size = int.from_bytes(self._read(2), "big")
+            elif size == 127:
+                size = int.from_bytes(self._read(8), "big")
+            mask = self._read(4) if second & 0x80 else None
+            payload = self._read(size)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            opcode = first & 0x0F
+            if opcode == 8:
+                raise OSError("the browser closed the connection")
+            if opcode in (0, 1, 2):
+                message += payload
+                if first & 0x80:
+                    return message.decode("utf-8", "replace")
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        self.send(json.dumps({"id": self.next_id, "method": method, "params": params or {}}))
+        while True:
+            reply = json.loads(self.receive())
+            if reply.get("id") == self.next_id:
+                if "error" in reply:
+                    raise OSError(reply["error"].get("message", "DevTools error"))
+                return reply.get("result", {})
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class BrowserSignIn:
+    """A small browser window on the Roblox login page, with a fresh profile of its own (so
+    each sign-in can be a different account). wait() returns the account's cookie once
+    Roblox has set it and it checks out, or None if the window was closed first."""
+
+    POLL = 1.0
+    OPEN_WAIT = 30  # seconds for the browser to open its DevTools port
+
+    def __init__(self, url=LOGIN_URL, check=None, browser=None, extra_args=()):
+        self.url = url
+        self.check = check or (lambda cookie: who_is(cookie))  # raises if it doesn't sign in
+        self.browser = browser or find_browser()
+        self.extra_args = list(extra_args)
+        self.profile = None
+        self.process = None
+        self.socket = None
+        self.info = None  # what check() said about the signed-in account
+        self.cancelled = threading.Event()
+
+    def start(self):
+        if self.browser is None:
+            raise AccountError("Signing in needs Microsoft Edge or Google Chrome. Add the "
+                               "account with its cookie instead.")
+        self.profile = Path(tempfile.mkdtemp(prefix="hed-signin-"))
+        args = [str(self.browser), f"--user-data-dir={self.profile}", "--remote-debugging-port=0",
+                "--no-first-run", "--no-default-browser-check", "--disable-sync",
+                "--window-size=520,780", *self.extra_args, f"--app={self.url}"]
+        self.process = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def _connect(self):
+        port_file = self.profile / "DevToolsActivePort"
+        try:
+            port, path = port_file.read_text().split("\n")[:2]
+            return _WebSocket(int(port), path.strip())
+        except (OSError, ValueError):
+            return None
+
+    def wait(self, timeout=None):
+        """Cookie of the signed-in account, or None (window closed, cancelled or timed out)."""
+        # Edge often restarts itself on a new profile, so the process it was started as says
+        # nothing; the window counts as open while its DevTools port answers.
+        started = time.monotonic()
+        deadline = started + timeout if timeout else None
+        last_rejected = None
+        connected, misses = False, 0
+        try:
+            while not self.cancelled.is_set():
+                if deadline and time.monotonic() > deadline:
+                    return None
+                if self.socket is None:
+                    self.socket = self._connect()
+                    if self.socket is not None:
+                        connected, misses = True, 0
+                    elif connected:
+                        misses += 1
+                        if misses >= 3:  # it answered before and doesn't now: closed
+                            return None
+                    elif time.monotonic() - started > self.OPEN_WAIT:
+                        raise AccountError("The browser window didn't open.")
+                if self.socket is not None:
+                    try:
+                        cookies = self.socket.call("Storage.getCookies").get("cookies", [])
+                    except (OSError, ValueError):
+                        self.socket.close()
+                        self.socket = None
+                        cookies = []
+                    for cookie in cookies:
+                        value = cookie.get("value", "")
+                        if (cookie.get("name") == COOKIE_NAME and value and value != last_rejected
+                                and cookie.get("domain", "").endswith("roblox.com")):
+                            try:
+                                self.info = self.check(value)
+                                return value
+                            except AccountError:
+                                last_rejected = value  # not signed in yet; keep waiting
+                self.cancelled.wait(self.POLL)
+            return None
+        finally:
+            self.close()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def close(self):
+        """Shut the browser window and delete its profile (with the cookie in it)."""
+        if self.socket is None and self.profile is not None:
+            self.socket = self._connect()
+        if self.socket is not None:
+            try:
+                self.socket.call("Browser.close")
+            except (OSError, ValueError):
+                pass
+            self.socket.close()
+            self.socket = None
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.wait(5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        if self.profile is not None:
+            for _ in range(20):  # the browser lets go of its files a moment after closing
+                shutil.rmtree(self.profile, ignore_errors=True)
+                if not self.profile.exists():
+                    break
+                time.sleep(0.25)
+            self.profile = None
