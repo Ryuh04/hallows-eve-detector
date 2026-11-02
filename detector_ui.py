@@ -60,6 +60,7 @@ DANGER = "#f87171"
 DANGER_SOFT = "#2e1717"
 
 THUMB_MAX = 720  # widest live preview kept (pixels); the view scales it smoothly
+TRIM_EVERY = 120  # seconds between RAM trims while the switch is on
 
 # Lucide-style line icons (24x24, drawn with the stroke colour).
 ICONS = {
@@ -98,6 +99,8 @@ ICONS = {
     "x": '<path d="M18 6L6 18M6 6l12 12"/>',
     "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/>'
                 '<path d="M12 15V3"/>',
+    "chip": '<rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/>'
+            '<path d="M9 2v3M15 2v3M9 19v3M15 19v3M19 9h3M19 15h3M2 9h3M2 15h3"/>',
 }
 
 _icon_cache = {}
@@ -1266,6 +1269,31 @@ class App(QMainWindow):
         col.addWidget(self.nav_empty)
         col.addStretch(1)
 
+        trim = QFrame()
+        trim.setObjectName("stat")
+        trim.setToolTip("Frees the memory your Roblox windows aren't using right now, every "
+                        f"{TRIM_EVERY // 60} minutes (what the F6 ram dump hotkey does)")
+        trow = QHBoxLayout(trim)
+        trow.setContentsMargins(12, 10, 12, 10)
+        trow.setSpacing(10)
+        self.trim_badge = IconBadge("chip", MUTED, 30)
+        trow.addWidget(self.trim_badge)
+        tcol = QVBoxLayout()
+        tcol.setSpacing(0)
+        tcol.addWidget(label("Trim Roblox RAM", "title"))
+        self.trim_sub = label("Off", "small")
+        tcol.addWidget(self.trim_sub)
+        trow.addLayout(tcol, 1)
+        self.trim_toggle = Toggle(False)
+        self.trim_toggle.clicked.connect(lambda *_: self._toggle_trim())
+        trow.addWidget(self.trim_toggle)
+        col.addWidget(trim)
+        col.addSpacing(12)
+        self.trim_timer = QTimer(self)
+        self.trim_timer.setInterval(TRIM_EVERY * 1000)
+        self.trim_timer.timeout.connect(self._trim_ram)
+        self.trim_busy = False
+
         stats = QHBoxLayout()
         stats.setSpacing(8)
         self.stats = {}
@@ -2167,6 +2195,57 @@ class App(QMainWindow):
         self.discord_sub.setText(f"Pings {role}" if self.discord_on else "Paused")
         self.discord_badge.set_color(ACCENT if self.discord_on else MUTED)
 
+    # ------------------------------------------------------------------ RAM trim
+
+    def _toggle_trim(self):
+        """On: trim every Roblox client's memory now and then every TRIM_EVERY seconds."""
+        on = self.trim_toggle.isChecked()
+        self.trim_badge.set_color(ACCENT if on else MUTED)
+        if on:
+            self.trim_timer.start()
+            self.trim_sub.setText(f"Every {TRIM_EVERY // 60} min")
+            self._log(f"Trim Roblox RAM on: every {TRIM_EVERY // 60} minutes.")
+            self._trim_ram()
+        else:
+            self.trim_timer.stop()
+            self.trim_sub.setText("Off")
+            self._log("Trim Roblox RAM off.", "end")
+
+    def _trim_ram(self):
+        """Same as the F6 hotkey: trim every Roblox client's memory (on a worker thread)."""
+        if self.trim_busy:
+            return
+        self.trim_busy = True
+
+        def work():
+            try:
+                found, trimmed = core.trim_roblox_memory()
+                self.events.put(("trim_done", None, found, trimmed, None))
+            except Exception as e:
+                self.events.put(("trim_done", None, 0, 0, str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _trim_done(self, found, trimmed, error):
+        """Show the last trim under the switch; only problems go in the activity feed, so a
+        trim every two minutes doesn't flood it."""
+        self.trim_busy = False
+        if not self.trim_toggle.isChecked():
+            return
+        when = time.strftime("%H:%M")
+        if error:
+            self._log(f"RAM trim failed: {error}", "error")
+            short = "last trim failed"
+        elif not found:
+            short = "no Roblox clients"
+        elif trimmed == found:
+            short = f"{found} clients trimmed"
+        else:
+            self._log(f"RAM trimmed for {trimmed} of {found} clients (the rest couldn't be "
+                      "opened).", "error")
+            short = f"{trimmed} of {found} trimmed"
+        self.trim_sub.setText(f"Every {TRIM_EVERY // 60} min · {short} {when}")
+
     # ------------------------------------------------------------------ updates
 
     def _show_updates(self):
@@ -2258,6 +2337,9 @@ class App(QMainWindow):
                 if kind.startswith("update_"):
                     self._update_event(kind, data)
                     continue
+                if kind == "trim_done":
+                    self._trim_done(*data)
+                    continue
                 if run != self.run_id:
                     continue
                 if kind == "windows":
@@ -2306,6 +2388,7 @@ class App(QMainWindow):
             return
         self._closed = True
         self.timer.stop()
+        self.trim_timer.stop()
         self._save_geometry()
         self._close_slot_picker()
         self._close_log_windows()

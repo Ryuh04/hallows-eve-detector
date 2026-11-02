@@ -132,6 +132,39 @@ def find_roblox_windows():
 
 user32.GetWindow.restype = wt.HWND
 user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+psapi = ctypes.windll.psapi
+psapi.EmptyWorkingSet.argtypes = [wt.HANDLE]
+
+
+def trim_roblox_memory():
+    """The F6 hotkey of 'F6 ram dump.ahk': for every visible Roblox window, empty its
+    process's working set, so Windows pages out the memory it isn't using right now.
+
+    Returns (windows found, windows whose process could be trimmed).
+    """
+    pids = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def callback(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if process_name(pid.value) == ROBLOX_EXE:
+                pids.append(pid.value)
+        return True
+
+    user32.EnumWindows(callback, 0)
+    trimmed = 0
+    for pid in pids:
+        handle = kernel32.OpenProcess(0x1F0FFF, False, pid)  # PROCESS_ALL_ACCESS, as the script
+        if handle:
+            if psapi.EmptyWorkingSet(handle):
+                trimmed += 1
+            kernel32.CloseHandle(handle)
+    return len(pids), trimmed
 
 
 class WindowStream:
