@@ -1,0 +1,22 @@
+# Each person's own settings and data: never uploaded
+discord_config.json
+private_servers.json
+window_names.json
+rebirth_log.csv
+ui_settings.json
+hotbar_slots.json
+auto_rebirth.json
+hidden_windows.json
+installed_version.json
+detector_output.log
+debug_captures/
+
+# Shortcuts point at paths on one PC; Install.bat makes them
+*.lnk
+
+# Local backup of the old Tkinter version
+hallows_eve_detector_tkinter_backup.py
+Start OLD version (backup).bat
+
+__pycache__/
+*.pyc

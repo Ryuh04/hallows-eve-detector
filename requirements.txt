@@ -1,0 +1,7 @@
+mss
+numpy
+pillow
+rapidocr
+onnxruntime
+windows-capture
+PySide6-Essentials
