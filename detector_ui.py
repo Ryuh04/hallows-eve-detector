@@ -1088,7 +1088,7 @@ class UpdateDialog(Dialog):
         buttons.addWidget(self.install_btn)
         self.body.addLayout(buttons)
         mine = updater.installed()
-        self.version.setText(f"This copy: {updater.short(mine['sha'])}" if mine
+        self.version.setText(f"This copy: {updater.display(mine)}" if mine
                              else "This copy: version not known")
 
     def check(self):
@@ -1106,7 +1106,7 @@ class UpdateDialog(Dialog):
             self.detail.setText(f"{error}.")
             self.badge.set_color(WARN)
             return
-        what = f"{updater.short(newest['sha'])} from {newest['date']}: {newest['message']}"
+        what = f"{updater.display(newest)} from {newest['date']}: {newest['message']}"
         if state == "up_to_date":
             self.title.setText("You're up to date")
             self.detail.setText(f"This is the newest version ({what}).")
@@ -1333,8 +1333,9 @@ class App(QMainWindow):
         urow = QHBoxLayout()
         urow.setSpacing(4)
         mine = updater.installed()
-        self.version_label = label(f"Version {updater.short(mine['sha'])}" if mine else "Version —",
-                                   "small")
+        self.version_label = label(updater.display(mine) if updater.FROZEN
+                                   else f"Version {updater.display(mine)}", "small")
+        self.version_label.setToolTip("The version of the app you're running")
         urow.addWidget(self.version_label)
         urow.addStretch(1)
         self.update_btn = button("Check for updates", self._show_updates, "ghost", "refresh",
@@ -2437,6 +2438,7 @@ def run(core_module, interval, debug):
     """Open the window and run until it's closed."""
     global core
     core = core_module
+    updater.clean_up_old_exe()
     app = make_application()
     if core.ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(core.ICON_PATH)))

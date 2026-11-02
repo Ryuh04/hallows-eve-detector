@@ -53,7 +53,13 @@ import mss
 import numpy as np
 from PIL import Image
 
-APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+if getattr(sys, "frozen", False):
+    # The exe keeps its settings and logs in AppData, so the exe itself can sit anywhere
+    # (Desktop, Downloads) and be replaced by an update.
+    APP_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Hallows Eve Detector"
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    APP_DIR = Path(__file__).parent
 DEBUG_DIR = APP_DIR / "debug_captures"
 ROBLOX_EXE = "robloxplayerbeta.exe"
 TARGET = "hallowseve"
@@ -2289,7 +2295,28 @@ def main():
                          "window while the event is on; the first given without Dracula is held")
     ap.add_argument("--discord-test", action="store_true",
                     help="check the Discord setup and post a test message that pings the role")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the OCR engine and the window toolkit load, then exit (for builds)")
     args = ap.parse_args()
+
+    if args.self_test:
+        # Used after building the exe: everything it needs must be bundled and load. Exits
+        # with 1 (and the error in the output) instead of an error box, so builds can't hang.
+        try:
+            active, _, _ = EventDetector().check(Image.new("RGB", (640, 360), "white"))
+            import detector_ui  # Qt and the window code
+            assert detector_ui.App
+            import updater
+            print(f"self-test ok (OCR ran, event seen: {active}; "
+                  f"version {updater.display(updater.installed())})")
+            code = 0
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            code = 1
+        if sys.stdout:
+            sys.stdout.flush()
+        os._exit(code)
 
     make_dpi_aware()
 

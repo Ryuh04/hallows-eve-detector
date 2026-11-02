@@ -1,12 +1,18 @@
 """
 Updates from GitHub: is there a newer version of the app, and installing it.
 
-Versions are GitHub commits, so every push is a new version without numbering
-anything. The commit a copy was installed from is kept in installed_version.json
-(or read from .git in a clone). Installing downloads that commit's files and
-copies them over the app's own; your settings, logs and Discord config aren't in
-the repository, so they're never touched. If requirements.txt changed, the new
-packages are installed with pip. Then the app restarts itself.
+Two kinds of copies update differently:
+
+* The exe (HallowsEveDetector.exe, built by GitHub on every push): its version is
+  the release tag baked into it at build time. Updating downloads the newest
+  release's exe, swaps it in for the running one (Windows lets a running exe be
+  renamed) and restarts.
+* The Python files (a clone or a ZIP of the repository): versions are commits.
+  The commit a copy was installed from is kept in installed_version.json (or read
+  from .git in a clone). Updating downloads that commit's files and copies them
+  over the app's own, then installs new packages if requirements.txt changed.
+
+Either way, your settings, logs and Discord config are never touched.
 
 Run on its own to check from the command line:
     python updater.py           # say whether an update is available
@@ -15,6 +21,7 @@ Run on its own to check from the command line:
 
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -28,7 +35,10 @@ from pathlib import Path
 REPO = "Ryuh04/hallows-eve-detector"  # GitHub "owner/name"
 BRANCH = "main"
 API = "https://api.github.com"
-APP_DIR = Path(__file__).resolve().parent
+EXE_NAME = "HallowsEveDetector.exe"  # the release asset
+FROZEN = getattr(sys, "frozen", False)
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # where an exe's bundled files unpack
 STATE_PATH = APP_DIR / "installed_version.json"
 # Files that belong to the person using the app, never replaced by an update (they aren't
 # in the repository anyway; this is a second line of defence).
@@ -52,15 +62,21 @@ def _get(url, timeout=20):
         if e.code == 403:
             raise UpdateError("GitHub is limiting checks right now; try again in a while") from None
         if e.code == 404:
-            raise UpdateError(f"couldn't find {REPO} on GitHub") from None
+            raise UpdateError(f"couldn't find {'a release of ' if FROZEN else ''}{REPO} on GitHub") from None
         raise UpdateError(f"GitHub answered HTTP {e.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise UpdateError(f"couldn't reach GitHub ({getattr(e, 'reason', e)})") from None
 
 
 def installed(app_dir=APP_DIR):
-    """{'sha', 'date'} of the version this copy is, or None if it isn't known (e.g. it was
-    downloaded as a ZIP by hand)."""
+    """{'sha', 'date', 'tag'} of the version this copy is, or None if it isn't known (e.g.
+    the files were downloaded as a ZIP by hand)."""
+    if FROZEN:
+        try:
+            info = json.loads((BUNDLE_DIR / "build_info.json").read_text())
+            return {"sha": info.get("sha", ""), "date": info.get("date", ""), "tag": info["version"]}
+        except (OSError, ValueError, KeyError):
+            return None
     git = app_dir / ".git"
     if git.is_dir():
         try:
@@ -85,7 +101,17 @@ def installed(app_dir=APP_DIR):
 
 
 def latest():
-    """{'sha', 'date', 'message'} of the newest commit on GitHub."""
+    """The newest version on GitHub: the latest release for the exe ({'tag', 'sha', 'date',
+    'message', 'url'}), the newest commit for the Python files ({'sha', 'date', 'message'})."""
+    if FROZEN:
+        data = json.loads(_get(f"{API}/repos/{REPO}/releases/latest"))
+        asset = next((a for a in data.get("assets", []) if a["name"] == EXE_NAME), None)
+        if asset is None:
+            raise UpdateError("the newest release has no exe to download")
+        message = (data.get("body") or data.get("name") or data["tag_name"]).strip().splitlines()[0]
+        return {"tag": data["tag_name"], "sha": data.get("target_commitish", ""),
+                "date": (data.get("published_at") or "")[:10], "message": message,
+                "url": asset["browser_download_url"]}
     data = json.loads(_get(f"{API}/repos/{REPO}/commits/{BRANCH}"))
     commit = data["commit"]
     return {"sha": data["sha"], "date": commit["committer"]["date"][:10],
@@ -98,15 +124,25 @@ def check(app_dir=APP_DIR):
     mine, newest = installed(app_dir), latest()
     if mine is None:
         return "unknown", None, newest
-    return ("up_to_date" if mine["sha"] == newest["sha"] else "available"), mine, newest
+    same = mine.get("tag") == newest["tag"] if FROZEN else mine["sha"] == newest["sha"]
+    return ("up_to_date" if same else "available"), mine, newest
 
 
 def short(sha):
     return (sha or "")[:7]
 
 
+def display(version):
+    """How a version reads in the app: the release tag for the exe, the short commit otherwise."""
+    if not version:
+        return "—"
+    return version.get("tag") or short(version.get("sha"))
+
+
 def install(newest, app_dir=APP_DIR, progress=print):
     """Bring this copy to `newest` (from latest()). Returns a summary line."""
+    if FROZEN:
+        return _install_exe(newest, progress)
     old_requirements = _read(app_dir / "requirements.txt")
     if (app_dir / ".git").is_dir() and shutil.which("git"):
         progress("Pulling the newest version with git…")
@@ -131,6 +167,42 @@ def install(newest, app_dir=APP_DIR, progress=print):
             raise UpdateError("the new files are in place, but installing packages failed: "
                               + result.stderr.strip()[-300:])
     return f"Updated to {short(newest['sha'])} ({newest.get('message', '')})."
+
+
+def _install_exe(newest, progress, exe=None):
+    """Download the release's exe next to the running one and swap them. The running exe can
+    be renamed but not overwritten, so it becomes '.old' (deleted at the next start)."""
+    exe = Path(exe or sys.executable)
+    new, old = exe.with_name(exe.name + ".new"), exe.with_name(exe.name + ".old")
+    progress("Downloading the new version (about a minute)…")
+    data = _get(newest["url"], timeout=600)
+    if len(data) < 1_000_000 or data[:2] != b"MZ":
+        raise UpdateError("the download wasn't a Windows program")
+    try:
+        new.write_bytes(data)
+        progress("Swapping in the new version…")
+        if old.exists():
+            old.unlink()
+        os.replace(exe, old)
+        try:
+            os.replace(new, exe)
+        except OSError:
+            os.replace(old, exe)  # put the running one back
+            raise
+    except OSError as e:
+        new.unlink(missing_ok=True)
+        raise UpdateError(f"couldn't replace the program in {exe.parent} ({e.strerror or e}); "
+                          "move it to a folder you can write to, like your Desktop") from None
+    return f"Updated to {newest['tag']} ({newest.get('message', '')})."
+
+
+def clean_up_old_exe():
+    """Delete the previous exe left behind by an update (it was still running then)."""
+    if FROZEN:
+        try:
+            Path(sys.executable).with_name(Path(sys.executable).name + ".old").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _read(path):
@@ -174,15 +246,20 @@ def windowless_python():
 
 def restart(app_dir=APP_DIR):
     """Start a fresh copy of the app (without a console window); the caller then quits."""
-    subprocess.Popen([windowless_python(), str(app_dir / "hallows_eve_detector.py")],
-                     cwd=str(app_dir), creationflags=0x00000008 | 0x00000200)  # detached
+    detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    if FROZEN:
+        subprocess.Popen([sys.executable], cwd=str(Path(sys.executable).parent),
+                         creationflags=detached)
+    else:
+        subprocess.Popen([windowless_python(), str(app_dir / "hallows_eve_detector.py")],
+                         cwd=str(app_dir), creationflags=detached)
 
 
 if __name__ == "__main__":
     try:
         state, mine, newest = check()
-        print(f"This copy: {short(mine['sha']) if mine else 'unknown'}   "
-              f"newest: {short(newest['sha'])} {newest['date']} {newest['message']}")
+        print(f"This copy: {display(mine)}   newest: {display(newest)} {newest['date']} "
+              f"{newest['message']}")
         print({"up_to_date": "Up to date.", "available": "An update is available.",
                "unknown": "Can't tell which version this is."}[state])
         if state != "up_to_date" and "--install" in sys.argv[1:]:

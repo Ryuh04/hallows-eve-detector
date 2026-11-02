@@ -20,3 +20,9 @@ Start OLD version (backup).bat
 
 __pycache__/
 *.pyc
+
+# Building the exe (build_exe.ps1)
+build/
+dist/
+*.spec
+build_info.json
