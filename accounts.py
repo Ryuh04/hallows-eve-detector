@@ -276,8 +276,9 @@ def fetch_avatar(user_id, path, opener=None):
 # --------------------------------------------------------------------------- #
 
 class AccountStore:
-    """accounts.json: [{'id', 'name', 'display', 'cookie' (encrypted), 'link', 'watch', 'added'}].
-    Only used from the UI thread."""
+    """accounts.json: {'accounts': [{'id', 'name', 'display', 'cookie' (encrypted), 'server',
+    'watch', 'added'}], 'servers': [{'id', 'name', 'link'}]}. Each account joins one of the
+    saved private servers ('server' is its ID). Only used from the UI thread."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -285,24 +286,40 @@ class AccountStore:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.accounts = [a for a in data.get("accounts", []) if "id" in a and "cookie" in a]
+            self.servers = [s for s in data.get("servers", []) if "id" in s and "link" in s]
         except (OSError, ValueError, AttributeError):
-            self.accounts = []
+            self.accounts, self.servers = [], []
+        # Accounts used to keep a link each: turn those links into saved servers.
+        moved = False
+        for account in self.accounts:
+            link = account.pop("link", None)
+            account.setdefault("server", None)
+            if link is None:
+                continue
+            moved = True
+            if link.strip() and not account.get("server"):
+                server = next((s for s in self.servers if s["link"] == link.strip()), None)
+                server = server or self.add_server("", link.strip(), save=False)
+                account["server"] = server["id"]
+        if moved:
+            self.save()
 
     def save(self):
         temp = self.path.with_name(self.path.name + ".tmp")
-        temp.write_text(json.dumps({"accounts": self.accounts}, indent=1), encoding="utf-8")
+        temp.write_text(json.dumps({"accounts": self.accounts, "servers": self.servers}, indent=1),
+                        encoding="utf-8")
         os.replace(temp, self.path)
 
     def get(self, user_id):
         return next((a for a in self.accounts if a["id"] == user_id), None)
 
-    def add(self, info, cookie, link=""):
+    def add(self, info, cookie):
         """Save a checked sign-in ({'id', 'name', 'display'} from who_is). Signing in to an
         account that's already there just renews its sign-in. Returns (account, new)."""
         account = self.get(info["id"])
         new = account is None
         if new:
-            account = {"id": info["id"], "link": link, "added": time.strftime("%Y-%m-%d %H:%M")}
+            account = {"id": info["id"], "server": None, "added": time.strftime("%Y-%m-%d %H:%M")}
             self.accounts.append(account)
         account.update(name=info["name"], display=info["display"], cookie=protect(cookie))
         self.save()
@@ -311,11 +328,43 @@ class AccountStore:
     def cookie(self, account):
         return unprotect(account["cookie"])
 
-    def set_link(self, user_id, link):
-        account = self.get(user_id)
-        if account is not None and account.get("link", "") != link:
-            account["link"] = link
+    # Saved private servers
+
+    def server(self, server_id):
+        return next((s for s in self.servers if s["id"] == server_id), None)
+
+    def add_server(self, name, link, save=True):
+        """Save a private server; an empty name becomes "Server N". Returns it."""
+        server_id = max((s["id"] for s in self.servers), default=0) + 1
+        server = {"id": server_id, "name": name.strip() or f"Server {server_id}", "link": link.strip()}
+        self.servers.append(server)
+        if save:
             self.save()
+        return server
+
+    def rename_server(self, server_id, name):
+        server = self.server(server_id)
+        if server is not None and name.strip() and server["name"] != name.strip():
+            server["name"] = name.strip()
+            self.save()
+
+    def remove_server(self, server_id):
+        """Forget a server; accounts that joined it are left without one."""
+        self.servers = [s for s in self.servers if s["id"] != server_id]
+        for account in self.accounts:
+            if account.get("server") == server_id:
+                account["server"] = None
+        self.save()
+
+    def set_server(self, user_id, server_id):
+        account = self.get(user_id)
+        if account is not None and account.get("server") != server_id:
+            account["server"] = server_id
+            self.save()
+
+    def server_of(self, account):
+        """The saved server an account joins, or None."""
+        return self.server(account.get("server"))
 
     def set_watch(self, user_id, on):
         """Whether the app starts watching this account's Roblox window once it's launched."""

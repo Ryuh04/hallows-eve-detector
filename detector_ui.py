@@ -27,7 +27,7 @@ from PySide6.QtGui import (QColor, QFont, QFontDatabase, QIcon, QImage, QPainter
                            QPalette, QPen, QPixmap)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
                                QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
                                QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
@@ -106,6 +106,10 @@ ICONS = {
              '<path d="M22 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/>',
     "log-in": '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/>'
               '<path d="M15 12H3"/>',
+    "chevron-down": '<path d="M6 9l6 6 6-6"/>',
+    "server": '<rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" '
+              'height="8" rx="2"/><path d="M7 7h.01M7 17h.01"/>',
+    "plus": '<path d="M12 5v14M5 12h14"/>',
     "key": '<circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3L22 7l-3-3"/>',
 }
 
@@ -189,6 +193,14 @@ def stylesheet(font):
     QLineEdit {{ background: {BG}; border: 1px solid {BORDER}; border-radius: 9px;
                 padding: 9px 12px; selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
     QLineEdit:focus {{ border-color: {ACCENT}; }}
+    QPushButton#picker {{ background: {BG}; text-align: left; padding: 9px 12px; }}
+    QPushButton#picker:hover {{ border-color: #3a4356; }}
+    QPushButton#picker::menu-indicator {{ image: none; width: 0; }}
+    QMenu {{ background: {CARD_2}; border: 1px solid {BORDER}; border-radius: 9px; padding: 5px; }}
+    QMenu::item {{ padding: 7px 26px 7px 12px; border-radius: 6px; color: {TEXT}; }}
+    QMenu::item:selected {{ background: {HOVER}; }}
+    QMenu::item:disabled {{ color: {SUBTLE}; }}
+    QMenu::separator {{ height: 1px; background: {BORDER}; margin: 5px 6px; }}
     QLineEdit#rename {{ padding: 2px 6px; font-weight: 600; border-radius: 6px; }}
     QScrollArea {{ background: transparent; border: none; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
@@ -355,6 +367,26 @@ class Toggle(QAbstractButton):
 
     def sizeHint(self):
         return QSize(42, 24)
+
+
+class ElidedLabel(QLabel):
+    """A one-line label that ends in "…" when it doesn't fit, instead of spilling over."""
+
+    def __init__(self, text, name=None):
+        super().__init__()
+        self.full = text
+        if name:
+            self.setObjectName(name)
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self):
+        self.setText(self.fontMetrics().elidedText(self.full, Qt.ElideRight, max(0, self.width())))
 
 
 class Dot(QWidget):
@@ -1116,7 +1148,7 @@ class UpdateDialog(Dialog):
 # --------------------------------------------------------------------------- #
 
 class AccountRow(QFrame):
-    """One saved account: avatar, names, its private server link, Launch and Remove."""
+    """One saved account: avatar, names, the private server it joins, Launch and Remove."""
 
     def __init__(self, dialog, account):
         super().__init__()
@@ -1150,12 +1182,17 @@ class AccountRow(QFrame):
         col.addLayout(top)
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.link = QLineEdit(account.get("link", ""))
-        self.link.setPlaceholderText("Private server link (roblox.com/share?code=…)")
-        self.link.addAction(icon("link", MUTED), QLineEdit.LeadingPosition)
-        self.link.textChanged.connect(lambda text: self.app.accounts.set_link(self.user_id, text.strip()))
-        self.link.returnPressed.connect(self._launch)
-        row.addWidget(self.link, 1)
+        self.server_btn = QPushButton()
+        self.server_btn.setObjectName("picker")
+        self.server_btn.setCursor(Qt.PointingHandCursor)
+        self.server_btn.setIcon(icon("server", MUTED))
+        self.server_btn.setIconSize(QSize(15, 15))
+        self.server_btn.setToolTip("Click to pick the private server this account joins")
+        self.server_menu = QMenu(self.server_btn)
+        self.server_btn.setMenu(self.server_menu)
+        self.server_menu.aboutToShow.connect(self._fill_servers)
+        row.addWidget(self.server_btn, 1)
+        self.show_server()
         self.launch_btn = button("Launch", self._launch, "primary", "play",
                                  tip="Open Roblox as this account in the private server")
         self.launch_btn.setStyleSheet("padding: 8px 16px; font-size: 13px;")
@@ -1165,6 +1202,35 @@ class AccountRow(QFrame):
         col.addWidget(self.status)
         self.show_status(*self.app.account_status.get(self.user_id, ("", MUTED)))
         self._confirm = None
+
+    def show_server(self):
+        account = self.app.accounts.get(self.user_id) or {}
+        server = self.app.accounts.server_of(account)
+        self.server_btn.setText(f"  {server['name']}" if server else "  Choose a private server…")
+        self.server_btn.setStyleSheet("" if server else f"color:{MUTED};")
+
+    def _fill_servers(self):
+        """The menu: every saved server (the account's one ticked), then Add or edit."""
+        self.server_menu.clear()
+        self.server_menu.setMinimumWidth(self.server_btn.width())
+        current = (self.app.accounts.get(self.user_id) or {}).get("server")
+        for server in self.app.accounts.servers:
+            action = self.server_menu.addAction(server["name"])
+            action.setCheckable(True)
+            action.setChecked(server["id"] == current)
+            action.triggered.connect(lambda _=False, sid=server["id"]: self.pick_server(sid))
+        if not self.app.accounts.servers:
+            self.server_menu.addAction("No saved servers yet").setEnabled(False)
+        self.server_menu.addSeparator()
+        manage = self.server_menu.addAction(icon("pencil", MUTED), "Add or edit servers…")
+        manage.triggered.connect(lambda: self.dialog.show_servers(True))
+
+    def pick_server(self, server_id):
+        self.app.accounts.set_server(self.user_id, server_id)
+        self.show_server()
+        self.show_status("", MUTED)
+        if self.dialog.servers_box.isVisible():
+            self.dialog.rebuild_servers()
 
     def load_avatar(self):
         path = self.app.accounts.avatar_path(self.user_id)
@@ -1226,6 +1292,9 @@ class AccountsDialog(Dialog):
                                  tip="Paste an account's .ROBLOSECURITY cookie")
         add.addWidget(self.cookie_btn)
         add.addStretch(1)
+        self.servers_btn = button("Private servers", lambda: self.show_servers(), icon_name="server",
+                                  tip="Add, rename or remove your saved private servers")
+        add.addWidget(self.servers_btn)
         self.body.addLayout(add)
         self.note = label("", "small", wrap=True)
         self.note.hide()
@@ -1248,6 +1317,34 @@ class AccountsDialog(Dialog):
         self.cookie_box.hide()
         self.body.addWidget(self.cookie_box)
 
+        self.servers_box, servers_col = card((16, 12, 16, 12), 8)
+        servers_head = QHBoxLayout()
+        servers_head.addWidget(label("PRIVATE SERVERS", "section"))
+        servers_head.addStretch(1)
+        servers_head.addWidget(button("", lambda: self.show_servers(False), "ghost", "x",
+                                      tip="Hide the servers"))
+        servers_col.addLayout(servers_head)
+        self.server_list = QVBoxLayout()
+        self.server_list.setSpacing(6)
+        servers_col.addLayout(self.server_list)
+        srow = QHBoxLayout()
+        srow.setSpacing(8)
+        self.server_name = QLineEdit()
+        self.server_name.setPlaceholderText("Name (e.g. Main farm)")
+        self.server_name.setFixedWidth(170)
+        self.server_name.returnPressed.connect(self._add_server)
+        srow.addWidget(self.server_name)
+        self.server_link = QLineEdit()
+        self.server_link.setPlaceholderText("Private server link (roblox.com/share?code=…)")
+        self.server_link.addAction(icon("link", MUTED), QLineEdit.LeadingPosition)
+        self.server_link.returnPressed.connect(self._add_server)
+        srow.addWidget(self.server_link, 1)
+        self.add_server_btn = button("Add", self._add_server, icon_name="plus")
+        srow.addWidget(self.add_server_btn)
+        servers_col.addLayout(srow)
+        self.servers_box.hide()
+        self.body.addWidget(self.servers_box)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1261,7 +1358,7 @@ class AccountsDialog(Dialog):
 
         bottom = QHBoxLayout()
         self.launch_all_btn = button("Launch all", self._launch_all, icon_name="play",
-                                     tip="Launch every account that has a private server link")
+                                     tip="Launch every account that has a private server picked")
         bottom.addWidget(self.launch_all_btn)
         bottom.addStretch(1)
         bottom.addWidget(button("Close", self.close))
@@ -1320,11 +1417,97 @@ class AccountsDialog(Dialog):
             self.app._add_cookie(text)
 
     def _launch_all(self):
-        ready = [a["id"] for a in self.app.accounts.accounts if a.get("link", "").strip()]
+        store = self.app.accounts
+        ready = [a["id"] for a in store.accounts if store.server_of(a)]
         if not ready:
-            self.show_note("Paste a private server link into the accounts to launch first.", WARN)
+            self.show_note("Pick a private server for the accounts to launch first.", WARN)
             return
         self.app._launch_accounts(ready)
+
+    # Saved private servers
+
+    def show_servers(self, show=None):
+        show = not self.servers_box.isVisible() if show is None else show
+        self.servers_box.setVisible(show)
+        if show:
+            self.rebuild_servers()
+            if not self.app.accounts.servers:
+                self.server_link.setFocus()
+
+    def rebuild_servers(self):
+        while self.server_list.count():
+            item = self.server_list.takeAt(0)
+            if item.widget():
+                item.widget().hide()  # gone now, not only once Qt gets round to deleting it
+                item.widget().deleteLater()
+        store = self.app.accounts
+        for server in store.servers:
+            row = QFrame()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(8)
+            name = QLineEdit(server["name"])
+            name.setFixedWidth(170)
+            name.setToolTip("Click to rename")
+            name.editingFinished.connect(lambda sid=server["id"], w=name: self._rename_server(sid, w))
+            line.addWidget(name)
+            users = [a["name"] for a in store.accounts if a.get("server") == server["id"]]
+            link = ElidedLabel(server["link"], "small")
+            link.setToolTip(server["link"] + ("\nUsed by @" + ", @".join(users) if users else ""))
+            line.addWidget(link, 1)
+            count = label(core.plural(len(users), "account") if users else "unused", "small")
+            count.setMinimumWidth(count.sizeHint().width())
+            line.addWidget(count)
+            line.addWidget(button("", lambda sid=server["id"]: self._remove_server(sid), "ghost",
+                                  "trash", tip="Remove this server"))
+            self.server_list.addWidget(row)
+        if not store.servers:
+            self.server_list.addWidget(label("No saved servers yet. Name one and paste its link "
+                                             "below.", "small", wrap=True))
+
+    def _add_server(self):
+        link = self.server_link.text().strip()
+        try:
+            parsed = accounts.parse_server_link(link)
+            if not parsed.get("share") and not parsed.get("link_code"):
+                raise accounts.AccountError("That's a game link, not a private server link. Copy "
+                                            "the link from the server's Share button.")
+        except accounts.AccountError as e:
+            self.show_note(str(e), WARN)
+            return
+        store = self.app.accounts
+        if any(s["link"] == link for s in store.servers):
+            self.show_note("That server is already saved.", WARN)
+            return
+        server = store.add_server(self.server_name.text(), link)
+        self.server_name.clear()
+        self.server_link.clear()
+        # Accounts without a server get the first one added, saving a click.
+        for account in store.accounts:
+            if store.server_of(account) is None:
+                store.set_server(account["id"], server["id"])
+        self.show_note(f"Saved {server['name']}. Click an account's server to switch it.", GOOD)
+        self.servers_changed()
+
+    def _rename_server(self, server_id, widget):
+        if widget.text().strip():
+            self.app.accounts.rename_server(server_id, widget.text())
+        elif self.app.accounts.server(server_id):
+            widget.setText(self.app.accounts.server(server_id)["name"])
+        for row in self.rows.values():
+            row.show_server()
+
+    def _remove_server(self, server_id):
+        server = self.app.accounts.server(server_id)
+        self.app.accounts.remove_server(server_id)
+        if server:
+            self.show_note(f"Removed {server['name']}.", MUTED)
+        self.servers_changed()
+
+    def servers_changed(self):
+        self.rebuild_servers()
+        for row in self.rows.values():
+            row.show_server()
 
 
 class App(QMainWindow):
@@ -2522,8 +2705,11 @@ class App(QMainWindow):
             account = self.accounts.get(user_id)
             if account is None:
                 continue
-            link = account.get("link", "").strip()
+            server = self.accounts.server_of(account)
+            link = server["link"] if server else ""
             try:
+                if not link:
+                    raise accounts.AccountError("Pick a private server for this account first.")
                 accounts.parse_server_link(link)
                 cookie = self.accounts.cookie(account)
             except accounts.AccountError as e:

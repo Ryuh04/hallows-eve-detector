@@ -45,10 +45,11 @@ Click **Open** next to **Accounts** in the sidebar.
 1. Add an account:
    - **Sign in with browser** opens the Roblox login page in a small Edge window. Sign in as usual; the window closes by itself and the account is saved. Repeat for each account.
    - **Add with cookie** lets you paste an account's `.ROBLOSECURITY` cookie instead.
-2. Paste a private server link into the account (`roblox.com/share?code=…` or a `…?privateServerLinkCode=…` link).
-3. Click **Launch** (or **Launch all**). Roblox opens signed in to that account and joins the server.
+2. Save your private servers: click **Private servers**, give each one a name and paste its link (`roblox.com/share?code=…` or a `…?privateServerLinkCode=…` link), then **Add**. Rename a server by clicking its name; the bin removes it.
+3. Click an account's server box and pick the server it should join. Switch it the same way whenever you like.
+4. Click **Launch** (or **Launch all**). Roblox opens signed in to that account and joins the server.
 
-Every launch opens its own Roblox window: while the app is open it owns Roblox's one-window lock (taking it over from a Roblox that was open first), so any number of Roblox windows run side by side, launched here or opened yourself. The new window is named after the account and gets its private server link, ready for **Manage → Start watching**.
+Every launch opens its own Roblox window: while the app is open it owns Roblox's one-window lock (taking it over from a Roblox that was open first), so any number of Roblox windows run side by side, launched here or opened yourself. The new window is named after the account and gets its private server link for the Discord ping. With the account's **Start watching** switch on (the default), the app starts watching it straight away.
 
 Sign-ins are saved in `accounts.json`, encrypted by Windows for your Windows user only, so the file is useless on any other PC. **Never share your cookie**: anyone who has it is signed in as you.
 
