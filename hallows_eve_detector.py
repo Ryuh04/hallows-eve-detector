@@ -61,6 +61,9 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = Path(__file__).parent
 DEBUG_DIR = APP_DIR / "debug_captures"
+CASH_DEBUG_DIR = DEBUG_DIR / "unreadable_cash"  # screenshots where the cash couldn't be read
+WRONG_CASH_DEBUG_DIR = DEBUG_DIR / "wrong_cash"  # ones read wrong (a rebirth that didn't happen)
+CASH_DEBUG_KEEP = 50  # only the newest this many are kept in each
 ROBLOX_EXE = "robloxplayerbeta.exe"
 TARGET = "hallowseve"
 # Search band, as fractions of the window (left, top, right, bottom).
@@ -1298,6 +1301,26 @@ def parse_cash(text):
     return parse_money(text)
 
 
+def save_cash_debug(label, img, wrong_reading=None):
+    """Save a screenshot whose cash couldn't be read to CASH_DEBUG_DIR, or, given the
+    reading that turned out wrong, to WRONG_CASH_DEBUG_DIR, keeping only the newest
+    CASH_DEBUG_KEEP in each. Returns its path, or None if it couldn't be saved."""
+    try:
+        folder = CASH_DEBUG_DIR if wrong_reading is None else WRONG_CASH_DEBUG_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w-]+", "_", label).strip("_") or "window"
+        if wrong_reading is not None:
+            name += "_read_" + (re.sub(r"[^\w.-]+", "_", wrong_reading).strip("_.") or "blank")
+        path = folder / f"{time.strftime('%Y%m%d_%H%M%S')}_{name}.png"
+        img.save(path)
+        old = sorted(folder.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-CASH_DEBUG_KEEP]:
+            p.unlink(missing_ok=True)
+        return path
+    except (OSError, ValueError):
+        return None
+
+
 def read_cash(img):
     """(cash, as written) from 'Cash: 622,996,641,451$' or 'Cash: 118.66Qi$' in the bottom
     left; (None, '') if unreadable."""
@@ -1502,8 +1525,7 @@ class AutoRebirth:
             # The cost is already known: only open the menu once the cash covers it.
             img, cash, cash_text = self._read_cash(hwnd, img)
             if cash is None:
-                self.on_action(False, f"{label}: auto rebirth couldn't read the cash (tried "
-                                      f"{self.CASH_RETRIES + 1} times, {self.CASH_RETRY_WAIT:.0f} s apart)")
+                self._cash_unreadable(label, img)
                 return
             if cash < known[0]:
                 self.on_reading(hwnd, f"cash {cash_text} · next rebirth {known[1]} "
@@ -1526,14 +1548,14 @@ class AutoRebirth:
         self.known_cost[hwnd] = (menu["cost"], menu["cost_text"])
         img, cash, cash_text = self._read_cash(hwnd, img)
         if cash is None:
-            self.on_action(False, f"{label}: auto rebirth couldn't read the cash (tried "
-                                  f"{self.CASH_RETRIES + 1} times, {self.CASH_RETRY_WAIT:.0f} s apart)")
+            self._cash_unreadable(label, img)
             self._close(hwnd, menu, button if opened_it else None)
             return
         enough = cash >= menu["cost"]
         self.on_reading(hwnd, f"cash {cash_text} · next rebirth {menu['cost_text']}"
                               + ("" if enough else f" ({cash / menu['cost']:.0%})"))
         if enough:
+            read_from = img  # kept in case the reading turns out wrong
             self.click(hwnd, *menu["rebirth"])
             # The cash dropping means the rebirth went through, so close the menu straight
             # away (reading the cash is quick; reading the whole window isn't). If it
@@ -1554,7 +1576,7 @@ class AutoRebirth:
                 prompt = find_purchase_prompt(after) if after is not None else None
                 if prompt is not None:
                     self._dismiss_purchase(hwnd, label, prompt, cash_text, menu,
-                                           button if opened_it else None)
+                                           button if opened_it else None, read_from)
                     return
             self._close(hwnd, menu, button if opened_it else None)
             # The new cost is read from the last frame, now that the menu is shut.
@@ -1563,8 +1585,10 @@ class AutoRebirth:
             self.on_action(True, f"{label}: REBIRTHED with {cash_text} cash "
                                  f"(cost {menu['cost_text']})")
             if new_cash is not None and not went_through:
+                saved = save_cash_debug(label, read_from, cash_text)
                 self.on_action(False, f"{label}: cash didn't drop after Rebirth! "
-                                      f"({new_text}); it may not have gone through")
+                                      f"({new_text}); it may not have gone through"
+                                      + (f"; screenshot saved to {saved}" if saved else ""))
             if new_menu and new_menu["cost"] > menu["cost"]:
                 self.known_cost[hwnd] = (new_menu["cost"], new_menu["cost_text"])
                 if new_cash is not None:
@@ -1588,13 +1612,24 @@ class AutoRebirth:
                 cash, cash_text = read_cash(img)
         return img, cash, cash_text
 
-    def _dismiss_purchase(self, hwnd, label, prompt, cash_text, menu, sidebar_button):
+    def _cash_unreadable(self, label, img):
+        """Report it, saving the last screenshot to CASH_DEBUG_DIR to see why."""
+        saved = save_cash_debug(label, img)
+        self.on_action(False, f"{label}: auto rebirth couldn't read the cash (tried "
+                              f"{self.CASH_RETRIES + 1} times, {self.CASH_RETRY_WAIT:.0f} s apart)"
+                              + (f"; screenshot saved to {saved}" if saved else ""))
+
+    def _dismiss_purchase(self, hwnd, label, prompt, cash_text, menu, sidebar_button,
+                          read_from=None):
         """Close Roblox's purchase prompt with its ×, then the Rebirth menu. If the prompt
-        won't go away, stop auto rebirth for this window rather than keep clicking."""
+        won't go away, stop auto rebirth for this window rather than keep clicking.
+        read_from (the frame the cash was misread from) goes to WRONG_CASH_DEBUG_DIR."""
         self.click(hwnd, *prompt)
+        saved = save_cash_debug(label, read_from, cash_text) if read_from is not None else None
         self.on_action(False, f"{label}: rebirth wasn't affordable after all (read {cash_text} "
                               f"cash vs cost {menu['cost_text']}); closed Roblox's purchase "
-                              "prompt without buying")
+                              "prompt without buying"
+                              + (f"; screenshot saved to {saved}" if saved else ""))
         check = self.grab(hwnd, 0.8)
         if check is not None and find_purchase_prompt(check) is not None:
             with self._lock:

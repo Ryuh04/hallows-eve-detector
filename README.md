@@ -9,6 +9,7 @@ A Windows app that watches your Roblox windows for the **Hallows' Eve** event an
 - **Trim Roblox RAM:** frees memory your Roblox windows aren't using, every 2 minutes (on by default).
 - **Discord ping** (optional) with each window's private server link. Switch it off per window to detect there without pinging.
 - **Account launcher:** save your Roblox accounts and launch each one straight into its private server, as many Roblox windows at once as you like.
+- **Follow event** (optional): when one private server gets the event, your other accounts' windows move there and go back when it ends.
 
 Every window has its own switches, so you can run several Roblox windows at once.
 
@@ -52,6 +53,16 @@ Click **Open** next to **Accounts** in the sidebar.
 Every launch opens its own Roblox window: while the app is open it owns Roblox's one-window lock (taking it over from a Roblox that was open first), so any number of Roblox windows run side by side, launched here or opened yourself. The new window is named after the account and gets its private server link for the Discord ping. With the account's **Start watching** switch on (the default), the app starts watching it straight away.
 
 Sign-ins are saved in `accounts.json`, encrypted by Windows for your Windows user only, so the file is useless on any other PC. **Never share your cookie**: anyone who has it is signed in as you.
+
+## Follow event (optional)
+
+Switch on **Follow event** in the sidebar (it's off by default, and the app remembers your choice). When a watched window shows the event, every saved account with a Roblox window open in another private server is closed and reopened in the server with the event, one after another. The windows keep their names and switches, so they equip your chosen characters as usual. When the event ends, each account goes back to the server it was in. Its saved server doesn't change.
+
+- The window with the event needs a private server link: launch it from Accounts or paste the link on its page.
+- Only saved accounts move, and only ones with a window open. Accounts already in a server with the event stay there.
+- It doesn't move anyone if less than a minute of the event is left, or for a test event.
+- The moved windows don't ping Discord; the window that found the event already did.
+- The app has to stay open: if you close it during an event, the accounts stay where they are.
 
 ## Discord pings (optional)
 

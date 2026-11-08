@@ -62,6 +62,12 @@ DANGER_SOFT = "#2e1717"
 
 THUMB_MAX = 720  # widest live preview kept (pixels); the view scales it smoothly
 TRIM_EVERY = 120  # seconds between RAM trims while the switch is on
+FOLLOW_CONFIRM = 3  # seconds a window must show the event before accounts move to it
+FOLLOW_MIN_LEFT = 60  # with less left than this, moving (closing, joining, loading) isn't worth it
+FOLLOW_MIN_GONE = 5  # seconds without the banner before accounts go back, at the least...
+FOLLOW_END_GRACE = 15  # ...or this many if its countdown was never read
+FOLLOW_MAX_GONE = 60  # ...and never more than this, in case the countdown was misread
+FOLLOW_TEST_SECONDS = 180  # TEMPORARY: how long the Test follow button's pretend event lasts
 
 # Lucide-style line icons (24x24, drawn with the stroke colour).
 ICONS = {
@@ -1584,8 +1590,23 @@ class App(QMainWindow):
         self.account_status = {}  # user ID -> (text, colour) of its last launch
         self.signin = None  # the open browser sign-in window (accounts.BrowserSignIn)
         self.signin_thread = None
-        self.launch_queue = queue.Queue()  # (user ID, cookie, link, name, PID to close first)
+        # (user ID, cookie, link, name, PID to close first, whether it's still wanted)
+        self.launch_queue = queue.Queue()
+        self.launches_pending = 0  # queued launches whose results haven't been handled yet
+        self.moved_windows = {}  # user ID -> (PID being replaced by a relaunch, it was hidden)
+        self.rehide = set()  # PIDs to hide again once watching has restarted
         self.account_pids = {}  # user ID -> PID of the Roblox window launched for it
+        # Follow event: accounts move to the private server that has the event.
+        self.follow_on = self._saved_follow()
+        self.follow_target = None  # link of the server the accounts have moved to
+        self.follow_home = {}  # user ID -> link of the server it goes back to
+        self.follow_quiet = set()  # names of the moved windows: the event's already been pinged
+        self.follow_seen_at = self.follow_until = None  # banner last seen; countdown runs out
+        self.follow_over = False  # the event ended (moves still queued are dropped)
+        self.follow_since = {}  # hwnd -> when it started showing the event
+        self.follow_noted = set()  # links and windows already explained in the feed
+        self.follow_notes = []  # feed lines to show again after watching restarts
+        self.follow_test = None  # TEMPORARY: Test follow's (window, its link, when it ends)
         self.launcher = None
         self.watch_launched, self.auto_watch = {}, None  # launched windows to start watching
         self.watch_timer = QTimer(self)
@@ -1602,10 +1623,14 @@ class App(QMainWindow):
         self.setWindowTitle("Hallows' Eve Detector")
         if core.ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(core.ICON_PATH)))
-        self.setMinimumSize(900, 620)
+        self.setMinimumSize(900, 682)
         self._build()
         self._style_accounts()
         self._toggle_trim()  # starts the RAM trim timer (switch is on by default)
+        self._style_follow()
+        self.follow_timer = QTimer(self)
+        self.follow_timer.timeout.connect(self._follow_tick)
+        self.follow_timer.start(1000)
         self._restore_geometry()
         self.show_picker()
         self.timer = QTimer(self)
@@ -1720,6 +1745,28 @@ class App(QMainWindow):
         trow.addWidget(self.trim_toggle)
         col.addWidget(trim)
         col.addSpacing(12)
+
+        follow = QFrame()
+        follow.setObjectName("stat")
+        follow.setToolTip("When a watched window's private server gets Hallows' Eve, close your "
+                          "saved accounts' windows in other servers and reopen them there. They "
+                          "go back when it ends. Needs a server link on the window with the event.")
+        frow = QHBoxLayout(follow)
+        frow.setContentsMargins(12, 10, 12, 10)
+        frow.setSpacing(10)
+        self.follow_badge = IconBadge("server", MUTED, 30)
+        frow.addWidget(self.follow_badge)
+        fcol = QVBoxLayout()
+        fcol.setSpacing(0)
+        fcol.addWidget(label("Follow event", "title"))
+        self.follow_sub = label("Off", "small")
+        fcol.addWidget(self.follow_sub)
+        frow.addLayout(fcol, 1)
+        self.follow_toggle = Toggle(self.follow_on)  # off unless switched on before
+        self.follow_toggle.clicked.connect(lambda *_: self._toggle_follow())
+        frow.addWidget(self.follow_toggle)
+        col.addWidget(follow)
+        col.addSpacing(12)
         self.trim_timer = QTimer(self)
         self.trim_timer.setInterval(TRIM_EVERY * 1000)
         self.trim_timer.timeout.connect(self._trim_ram)
@@ -1796,6 +1843,13 @@ class App(QMainWindow):
             self.pages.removeWidget(old)
             old.deleteLater()
 
+    @staticmethod
+    def _saved_follow():
+        try:
+            return bool(json.loads(core.UI_SETTINGS_PATH.read_text()).get("follow_event"))
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def _restore_geometry(self):
         """Last session's window size and position (old 'WxH+X+Y' settings work too)."""
         try:
@@ -1824,7 +1878,8 @@ class App(QMainWindow):
                 "qt_geometry": bytes(self.saveGeometry().toBase64()).decode(),
                 # Also in the old form, so the Tkinter backup opens in the same place.
                 "geometry": f"{normal.width()}x{normal.height()}+{normal.x()}+{normal.y()}",
-                "maximized": self.isMaximized()}))
+                "maximized": self.isMaximized(),
+                "follow_event": self.follow_on}))
         except OSError:
             pass
 
@@ -1961,6 +2016,9 @@ class App(QMainWindow):
         self._update_start()
         if auto is not None and any(self.chosen.values()):
             self.start_watching()
+            for note in self.follow_notes:
+                self._log(note, "start")
+            self.follow_notes = []
             if auto[1]:
                 self._log(auto[1])
 
@@ -2054,13 +2112,25 @@ class App(QMainWindow):
         self._update_stats()
         self._watching_status()
 
+        for hwnd, name, pid in selected:  # hidden before watching restarted (see _watch_launched)
+            if pid in self.rehide:
+                core.hide_window(hwnd)
+                self._style_hide(hwnd)
+        self.rehide = set()
+
         self.run_id += 1
         run = self.run_id
         self.stop_event = stop = threading.Event()
         last_thumb = {}
 
+        old_equipper, old_notifier = self.equipper, self.notifier
         self.equipper = core.HotbarEquipper(
             on_action=lambda ok, text: self.events.put(("hotbar", run, ok, text)))
+        if old_equipper:
+            # Hotbar keys toggle: without knowing what's held, the first press during an event
+            # would unequip it. Windows that closed drop out with their handles.
+            self.equipper.equipped = {h: s for h, s in old_equipper.equipped.items() if h in self.rows}
+            self.equipper.mutated = {h: m for h, m in old_equipper.mutated.items() if h in self.rows}
         self.popups = core.PopupCloser(
             on_action=lambda ok, text: self.events.put(("hotbar", run, ok, text)))
         self.popups.enabled_for = dict(self.anti_disconnect)
@@ -2086,7 +2156,11 @@ class App(QMainWindow):
         if self.notifier:
             self.notifier.enabled = self.discord_on
             self.notifier.link_for = self._private_server_of
-            self.notifier.ping_for = lambda label: label not in self.no_ping
+            self.notifier.ping_for = (lambda label: label not in self.no_ping
+                                      and label not in self.follow_quiet)
+            if old_notifier:  # the same event in the same window isn't pinged twice
+                self.notifier._last_seen = dict(old_notifier._last_seen)
+                self.notifier._last_ping = old_notifier._last_ping
 
             def check_discord(notifier=self.notifier):
                 # Look up the channel and role now, so setup problems show up before an event.
@@ -2219,6 +2293,9 @@ class App(QMainWindow):
         bhead.setSpacing(8)
         bhead.addWidget(label("HOTBAR  ·  AUTO EQUIP", "section"))
         bhead.addStretch(1)
+        bhead.addWidget(button("Test follow", lambda h=hwnd: self._test_follow(h), icon_name="server",
+                               tip="TEMPORARY: pretend this window's server has Hallows' Eve, so "
+                                   "accounts in other servers really move here and go back"))
         bhead.addWidget(button(f"Test {core.TEST_EVENT_SECONDS} s", lambda h=hwnd: self._simulate(h),
                                icon_name="play",
                                tip="Act as if Hallows' Eve were on here (no Discord ping)"))
@@ -2302,6 +2379,7 @@ class App(QMainWindow):
         if strip is not None:  # keep the last good one when the hotbar is covered
             picture, boxes = strip
             widgets["strip"].set_picture(pil_to_qimage(picture), boxes)
+            widgets["hotbar_seen"] = True
         if active:
             self.active.add(hwnd)
             text, fg, bg, short = "Hallows' Eve active", ACCENT, ACCENT_SOFT, "Hallows' Eve"
@@ -2341,7 +2419,7 @@ class App(QMainWindow):
             return
         test = hwnd in self.simulated
         if active:
-            if not test:
+            if not test and not self.follow_target:  # moving windows restarts watching
                 self.events_seen += 1
             extra = f"  ·  {core.fmt_clock(left)} left" if left is not None else ""
             self._log(f"{widgets['label']}: {'TEST ' * test}Hallows' Eve started{extra}", "start")
@@ -2774,16 +2852,18 @@ class App(QMainWindow):
         name = core.clean_window_name(account["name"])
         return next((p for p in sorted(alive) if self.window_names.get(p) == name), None)
 
-    def _launch_accounts(self, user_ids, relaunch=False):
+    def _launch_accounts(self, user_ids, relaunch=False, to_link=None, wanted=None):
         """Queue launches; they run one after another, each waiting for its Roblox window so
         the window can be told apart from the others (and given the account's name and its
-        private server link). `relaunch` closes the account's open window first."""
+        private server link). `relaunch` closes the account's open window first. `to_link`
+        joins that server instead of the account's own; `wanted` is asked just before a launch
+        starts, and it's dropped if it says no."""
         for user_id in user_ids:
             account = self.accounts.get(user_id)
             if account is None:
                 continue
             server = self.accounts.server_of(account)
-            link = server["link"] if server else ""
+            link = to_link or (server["link"] if server else "")
             try:
                 if not link:
                     raise accounts.AccountError("Pick a private server for this account first.")
@@ -2795,18 +2875,25 @@ class App(QMainWindow):
             self._set_account_status(user_id, "Waiting for the launch before it…"
                                      if self.launch_queue.unfinished_tasks else "Starting…")
             close = self.account_pid(user_id) if relaunch else None
-            self.launch_queue.put((user_id, cookie, link, account["name"], close))
+            if close is not None:
+                hwnd = next((h for h, w in self.rows.items() if w["pid"] == close), None)
+                self.moved_windows[user_id] = (close, hwnd is not None and core.is_hidden(hwnd))
+            self.launches_pending += 1
+            self.launch_queue.put((user_id, cookie, link, account["name"], close, wanted))
         if self.launcher is None:
             self.launcher = threading.Thread(target=self._launch_worker, daemon=True)
             self.launcher.start()
 
     def _launch_worker(self):
         while True:
-            user_id, cookie, link, name, close = self.launch_queue.get()
+            user_id, cookie, link, name, close, wanted = self.launch_queue.get()
             try:
                 def post(text, color=MUTED):
                     self.events.put(("acct_status", None, user_id, text, color))
 
+                if wanted is not None and not wanted():
+                    self.events.put(("acct_dropped", None, user_id))
+                    continue
                 if close is not None:
                     post("Closing the old Roblox window…")
                     hwnds = [h for h, p, _ in core.find_roblox_windows() if p == close]
@@ -2829,6 +2916,7 @@ class App(QMainWindow):
             except Exception as e:  # never let one launch stop the ones after it
                 post(f"Unexpected problem: {e}", DANGER)
             finally:
+                self.events.put(("acct_done", None))
                 self.launch_queue.task_done()
 
     def _account_window(self, user_id, name, link, pid):
@@ -2841,12 +2929,16 @@ class App(QMainWindow):
         self.account_pids[user_id] = pid
         self.private_servers[pid] = link
         core.save_private_servers(self.private_servers)
+        old, was_hidden = self.moved_windows.pop(user_id, (None, False))
+        was_watched = old is not None and self._carry_window_settings(old, pid)
+        if was_hidden:
+            self.rehide.add(pid)
         if pid not in self.window_names:
             self.window_names[pid] = core.clean_window_name(name)
             core.save_window_names(self.window_names)
         self._set_account_status(user_id, f"Opened at {time.strftime('%H:%M')} · PID {pid}", GOOD)
         account = self.accounts.get(user_id)
-        watch = account is not None and account.get("watch", True)
+        watch = account is not None and (account.get("watch", True) or was_watched)
         self._log(f"Accounts: launched @{name} into its server (PID {pid})."
                   + (" Use Manage to watch the new window." if self.rows and not watch else ""))
         if watch:
@@ -2857,6 +2949,22 @@ class App(QMainWindow):
                 self.refresh()
             except RuntimeError:
                 pass
+
+    def _carry_window_settings(self, old, new):
+        """A relaunch replaced Roblox process `old` with `new`: it keeps the window's name and
+        switches. Returns whether the old window was being watched."""
+        if old in self.session_slots:
+            self.session_slots[new] = self.session_slots.pop(old)
+        for kept in (self.session_rebirth, self.session_detect_off, self.session_anti_off):
+            if old in kept:
+                kept.discard(old)
+                kept.add(new)
+        if old in self.window_names:
+            self.window_names[new] = self.window_names[old]
+            core.save_window_names(self.window_names)
+        if self.current_tab == old:
+            self.current_tab = new
+        return any(w["pid"] == old for w in self.rows.values())
 
     def _refresh_windows(self):
         """Look for Roblox windows again. While watching: keep watching the same windows,
@@ -2900,6 +3008,7 @@ class App(QMainWindow):
         self.watch_launched = {}
         if not new:
             return
+        self.rehide |= {w["pid"] for hwnd, w in self.rows.items() if core.is_hidden(hwnd)}
         # Keep what's watched now; from the picker, keep what's picked there.
         keep = ({w["pid"] for w in self.rows.values()} if self.rows
                 else {pid for hwnd, pid, _, _ in getattr(self, "windows", [])
@@ -2932,6 +3041,11 @@ class App(QMainWindow):
                       "relaunch it in its new server.")
             self.private_servers.pop(pid, None)
             core.save_private_servers(self.private_servers)
+        elif kind == "acct_done":
+            self.launches_pending -= 1
+        elif kind == "acct_dropped":
+            self.moved_windows.pop(data[0], None)
+            self._set_account_status(data[0], "Stayed in its server: the event was ending.")
         elif kind == "acct_multi":
             self.multi_roblox = data[0]
             dialog = self._accounts_window()
@@ -2939,6 +3053,10 @@ class App(QMainWindow):
                 dialog.show_multi()
         elif kind == "acct_status":
             self._set_account_status(*data)
+            user_id, text, color = data
+            if color == DANGER and user_id in self.follow_home:
+                name = (self.accounts.get(user_id) or {"name": "?"})["name"]
+                self._follow_log(f"Follow event: @{name}: {text}", "error")
         elif kind == "acct_window":
             self._account_window(*data)
         elif kind == "acct_note":
@@ -2956,6 +3074,179 @@ class App(QMainWindow):
             dialog = self._accounts_window()
             if dialog is not None and data[0] in dialog.rows:
                 dialog.rows[data[0]].load_avatar()
+
+    # ------------------------------------------------------------------ follow the event
+
+    def _toggle_follow(self):
+        self.follow_on = self.follow_toggle.isChecked()
+        self._save_geometry()
+        self._style_follow()
+        self._log("Follow event on: your accounts move to the private server that has the "
+                  "event, and go back when it ends." if self.follow_on else
+                  "Follow event off." + (" Accounts already moved still go back when "
+                                                "the event ends." if self.follow_target else ""))
+
+    def _style_follow(self):
+        self.follow_sub.setText("Moves accounts" if self.follow_on else "Off")
+        self.follow_badge.set_color(ACCENT if self.follow_on else MUTED)
+
+    def _follow_log(self, text, tag="start"):
+        self._log(text, tag)
+        self.follow_notes.append(text)  # watching restarts when the windows move, with a new feed
+
+    def _server_name(self, link):
+        server = next((s for s in self.accounts.servers if s["link"] == link), None)
+        return f'"{server["name"]}"' if server else "that private server"
+
+    def _window_link(self, hwnd):
+        return self.private_servers.get(self.rows[hwnd]["pid"], "").strip()
+
+    def _test_follow(self, hwnd):
+        """TEMPORARY, for trying Follow event without waiting for a real Hallows' Eve: pretend
+        this window's server has the event. No Discord ping, like any test event."""
+        name = self.rows[hwnd]["label"]
+        link = self._window_link(hwnd)
+        if not link:
+            self._log(f"Test follow: {name} has no private server link.", "error")
+        elif self.follow_test or self.follow_target or self.launches_pending:
+            self._log("Test follow: wait for the current move or launch to finish.", "error")
+        else:
+            self.follow_test = (hwnd, link, time.monotonic() + FOLLOW_TEST_SECONDS)
+            self.follow_noted = set()
+            self._log(f"Test follow: pretending {self._server_name(link)} has Hallows' Eve for "
+                      f"{core.fmt_clock(FOLLOW_TEST_SECONDS)}. Accounts in other servers will "
+                      "really close and reopen.", "start")
+
+    def _apply_follow_test(self, now):
+        """TEMPORARY: keep the pretend event on in its server's windows, also after watching
+        restarts. A moved window joins in once its hotbar shows, so not while it's loading (a
+        real banner doesn't show before then either)."""
+        if not self.follow_test:
+            return None
+        source, link, until = self.follow_test
+        if now >= until:
+            self.follow_test = None
+            return None
+        for hwnd, widgets in self.rows.items():
+            if self._window_link(hwnd) == link and (hwnd == source or widgets.get("hotbar_seen")):
+                self.simulated[hwnd] = until
+        return link
+
+    def _follow_tick(self):
+        """Every second: while accounts have moved, watch for the event ending there; otherwise
+        look for a window showing the event, to move them to its server. Moves wait for any
+        launch in progress, whose window isn't known yet."""
+        now = time.monotonic()
+        test_link = self._apply_follow_test(now)  # TEMPORARY
+        real = {h for h in self.active if h in self.rows and (
+            h not in self.simulated or (test_link and self._window_link(h) == test_link))}
+        self.follow_since = {h: self.follow_since.get(h, now) for h in real}
+        if not real:
+            self.follow_noted = set()
+        if self.follow_target:
+            for hwnd in real:
+                if self._window_link(hwnd) == self.follow_target:
+                    self.follow_seen_at = now
+                    left = self.rows[hwnd].get("left_s")
+                    if left is not None:
+                        self.follow_until = now + left
+            gone = now - self.follow_seen_at
+            if gone >= FOLLOW_MIN_GONE and (gone >= FOLLOW_MAX_GONE or (
+                    now >= self.follow_until if self.follow_until is not None
+                    else gone >= FOLLOW_END_GRACE)):
+                self.follow_over = True
+                if not self.launches_pending:
+                    self._follow_return()
+        elif (self.follow_on or test_link) and not self.launches_pending:
+            self._follow_start(now, real)
+
+    def _follow_wanted(self, link):
+        """Is a queued move to this server still worth doing? (Asked on the launch thread.)"""
+        until = self.follow_until
+        return (self.follow_target == link and not self.follow_over
+                and (until is None or until - time.monotonic() > FOLLOW_MIN_LEFT / 2))
+
+    def _follow_start(self, now, real):
+        # A brief misreading of the banner mustn't close anyone's windows.
+        confirmed = [h for h in real if now - self.follow_since[h] >= FOLLOW_CONFIRM]
+        if not confirmed:
+            return
+        links = {self._window_link(h) for h in real} - {""}  # servers that have the event
+        # The one with the most time left; a countdown not read yet counts as plenty.
+        confirmed.sort(key=lambda h: -(self.rows[h].get("left_s") or 1e9))
+        for hwnd in confirmed:
+            link = self._window_link(hwnd)
+            if not link:
+                if hwnd not in self.follow_noted:
+                    self.follow_noted.add(hwnd)
+                    self._log(f"Follow event: {self.rows[hwnd]['label']} has no private "
+                              "server link, so the other accounts can't join it.", "end")
+                continue
+            if link in self.follow_noted:
+                continue
+            left = self.rows[hwnd].get("left_s")
+            if left is not None and left < FOLLOW_MIN_LEFT:
+                self.follow_noted.add(link)
+                self._log(f"Follow event: {core.fmt_clock(left)} left in "
+                          f"{self._server_name(link)}, too little to move accounts there.", "end")
+                continue
+            home = {}
+            for account in self.accounts.accounts:
+                pid = self.account_pid(account["id"])
+                current = self.private_servers.get(pid, "").strip() if pid is not None else ""
+                if pid is None or current == link or current in links:
+                    continue  # no window open, or already in a server with the event
+                saved = self.accounts.server_of(account)
+                back = current or (saved["link"] if saved else "")
+                if back:
+                    home[account["id"]] = back
+                else:
+                    self._log(f"Follow event: @{account['name']} stays put: there's no "
+                              "server to bring it back to.", "end")
+            self.follow_noted.add(link)
+            if home:
+                self._follow_move(link, left, home, self.rows[hwnd]["label"], now)
+            elif self.follow_test:  # TEMPORARY
+                self._log("Test follow: no saved account has a window open in another server, "
+                          "so there's nobody to move.", "end")
+            return
+
+    def _follow_move(self, link, left, home, source, now):
+        self.follow_target, self.follow_home, self.follow_over = link, home, False
+        self.follow_seen_at, self.follow_until = now, now + left if left is not None else None
+        names = [self.accounts.get(user_id)["name"] for user_id in home]
+        self.follow_quiet = set()
+        for user_id in home:
+            name = self.accounts.get(user_id)["name"]
+            pid = self.account_pid(user_id)
+            self.follow_quiet.add(self.window_names.get(pid, core.clean_window_name(name)))
+        self._follow_log(f"Follow event: {source} has the event in "
+                         f"{self._server_name(link)}"
+                         + (f" ({core.fmt_clock(left)} left)" if left is not None else "")
+                         + ". Moving " + ", ".join(f"@{n}" for n in names) + " there.")
+        self._launch_accounts(list(home), relaunch=True, to_link=link,
+                              wanted=lambda: self._follow_wanted(link))
+
+    def _follow_return(self):
+        """The event's over: every moved account goes back to the server it was in."""
+        home, self.follow_home = self.follow_home, {}
+        self.follow_target = self.follow_seen_at = self.follow_until = None
+        self.follow_over = False
+        self.follow_quiet = set()
+        back = []
+        for user_id, link in home.items():
+            account = self.accounts.get(user_id)
+            pid = self.account_pid(user_id)
+            if account is None or (pid is not None
+                                   and self.private_servers.get(pid, "").strip() == link):
+                continue  # deleted, never moved, or already back
+            back.append((user_id, link, account["name"]))
+        if not back:
+            return
+        self._follow_log("Follow event: the event's over. Sending "
+                         + ", ".join(f"@{n}" for _, _, n in back) + " back.", "end")
+        for user_id, link, _ in back:
+            self._launch_accounts([user_id], relaunch=True, to_link=link)
 
     # ------------------------------------------------------------------ RAM trim
 
