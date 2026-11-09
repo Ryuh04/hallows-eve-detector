@@ -3,6 +3,9 @@ discord_config.json
 private_servers.json
 window_names.json
 rebirth_log.csv
+window_closes.csv
+previous_session.json
+previous_session.json.tmp
 ui_settings.json
 hotbar_slots.json
 auto_rebirth.json

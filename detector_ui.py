@@ -62,6 +62,10 @@ DANGER_SOFT = "#2e1717"
 
 THUMB_MAX = 720  # widest live preview kept (pixels); the view scales it smoothly
 TRIM_EVERY = 120  # seconds between RAM trims while the switch is on
+SESSION_SAVE_EVERY = 5  # seconds between looks at what Relaunch previous session should reopen
+LAUNCH_AT_ONCE = 8  # accounts starting at the same time; any more wait for one of these to finish
+WINDOW_CHECK_EVERY = 0.25  # seconds between looks for a launched account's window
+FOLLOW_CLOSE_GRACE = 1  # seconds a window Follow event moves gets to close itself before it's ended
 FOLLOW_CONFIRM = 3  # seconds a window must show the event before accounts move to it
 FOLLOW_MIN_LEFT = 60  # with less left than this, moving (closing, joining, loading) isn't worth it
 FOLLOW_MIN_GONE = 5  # seconds without the banner before accounts go back, at the least...
@@ -320,6 +324,45 @@ def slot_at(boxes, x, y, pad):
 # --------------------------------------------------------------------------- #
 # Widgets
 # --------------------------------------------------------------------------- #
+
+class Tick(QAbstractButton):
+    """A tick box, in the app's colours."""
+
+    def __init__(self, checked=False, tip=None):
+        super().__init__()
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(20, 20)
+        if tip:
+            self.setToolTip(tip)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        box = QRectF(1, 1, 18, 18)
+        if self.isChecked():
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(ACCENT))
+            p.drawRoundedRect(box, 5, 5)
+            pen = QPen(QColor("#ffffff"), 2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawPolyline([QPointF(5.5, 10.5), QPointF(8.5, 13.5), QPointF(14.5, 7)])
+        else:
+            p.setPen(QPen(QColor(ACCENT_HOVER if self.underMouse() else SUBTLE), 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(box, 5, 5)
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+
 
 class Toggle(QAbstractButton):
     """An on/off switch with a sliding knob. `clicked` fires only when the user flips it."""
@@ -1166,6 +1209,9 @@ class AccountRow(QFrame):
         col.setSpacing(10)
         top = QHBoxLayout()
         top.setSpacing(12)
+        self.tick = Tick(account.get("ticked", False), "Tick to include in Launch selected")
+        self.tick.toggled.connect(self._ticked)
+        top.addWidget(self.tick)
         self.avatar = ImageView("", radius=22)
         self.avatar.setFixedSize(44, 44)
         self.load_avatar()
@@ -1200,7 +1246,8 @@ class AccountRow(QFrame):
         row.addWidget(self.server_btn, 1)
         self.show_server()
         self.launch_btn = button("Launch", self._launch, "primary", "play",
-                                 tip="Open Roblox as this account in the private server")
+                                 tip="Open Roblox as this account in the private server, unless "
+                                     "it's already open")
         self.launch_btn.setStyleSheet("padding: 8px 16px; font-size: 13px;")
         row.addWidget(self.launch_btn)
         col.addLayout(row)
@@ -1217,6 +1264,10 @@ class AccountRow(QFrame):
         self.show_status(*self.app.account_status.get(self.user_id, ("", MUTED)))
         self.check_relaunch(quiet=True)
         self._confirm = None
+
+    def _ticked(self, on):
+        self.app.accounts.set_ticked(self.user_id, on)
+        self.dialog.show_selected()
 
     def show_server(self):
         account = self.app.accounts.get(self.user_id) or {}
@@ -1390,9 +1441,17 @@ class AccountsDialog(Dialog):
         self.rows = {}
 
         bottom = QHBoxLayout()
+        self.launch_selected_btn = button("Launch selected", self._launch_selected, "primary", "play",
+                                          tip="Launch the ticked accounts. Ones already open are "
+                                              "left as they are.")
+        bottom.addWidget(self.launch_selected_btn)
         self.launch_all_btn = button("Launch all", self._launch_all, icon_name="play",
-                                     tip="Launch every account that has a private server picked")
+                                     tip="Launch every account that has a private server picked. "
+                                         "Ones already open are left as they are.")
         bottom.addWidget(self.launch_all_btn)
+        self.session_btn = button("Relaunch previous session", app._relaunch_session,
+                                  icon_name="refresh")
+        bottom.addWidget(self.session_btn)
         bottom.addStretch(1)
         bottom.addWidget(button("Close", self.close))
         self.body.addLayout(bottom)
@@ -1405,13 +1464,16 @@ class AccountsDialog(Dialog):
     def show_multi(self):
         if self.app.multi_roblox:
             self.multi.set("Multiple Roblox windows: on", GOOD, GOOD_SOFT)
-            self.multi.setToolTip("The app holds Roblox's one-window lock, so every Roblox you "
-                                  "open stays open next to the others.")
+            self.multi.setToolTip("Roblox's one-window lock is held for you, so every Roblox you "
+                                  "open stays open next to the others, and they stay open when "
+                                  "this app closes.")
         else:
             self.multi.set("Multiple Roblox windows: shared", WARN, WARN_SOFT)
-            self.multi.setToolTip("Another multi-Roblox tool (like Roblox Account Manager) holds "
-                                  "Roblox's one-window lock, which works just as well while it's "
-                                  "open. The app takes the lock over as soon as it can.")
+            self.multi.setToolTip("A Roblox opened before this app, or another multi-Roblox tool "
+                                  "(like Roblox Account Manager), holds Roblox's one-window lock. "
+                                  "Taking it would close those windows, so the app waits until it's "
+                                  "free. To be sure of several windows, close Roblox and launch "
+                                  "from here.")
 
     def show_note(self, text, color=MUTED):
         self.note.setText(text)
@@ -1437,6 +1499,26 @@ class AccountsDialog(Dialog):
         self.list.addStretch(1)
         self.launch_all_btn.setEnabled(len(self.rows) > 1)
         self.signin_btn.setEnabled(self.app.signin is None)
+        self.show_selected()
+        self.show_session()
+
+    def show_selected(self):
+        count = sum(row.tick.isChecked() for row in self.rows.values())
+        self.launch_selected_btn.setText(f"Launch selected ({count})" if count else "Launch selected")
+        self.launch_selected_btn.setEnabled(count > 0)
+
+    def show_session(self):
+        session = self.app.session
+        names = [f"@{w['name']}" for w in session.get("windows", [])]
+        self.session_btn.setEnabled(bool(names))
+        self.session_btn.setToolTip(
+            f"Open {', '.join(names)} again, each in the server it was in, with the same name, "
+            f"switches and hotbar slots (saved {session.get('saved', '')}). Windows still open "
+            "aren't reopened, they just get their settings back." if names
+            else "Nothing to relaunch yet: the windows you watch are remembered here.")
+
+    def _launch_selected(self):
+        self.app._launch_accounts([u for u, row in self.rows.items() if row.tick.isChecked()])
 
     def _toggle_cookie(self):
         self.cookie_box.setVisible(not self.cookie_box.isVisible())
@@ -1593,11 +1675,19 @@ class App(QMainWindow):
         # (user ID, cookie, link, name, PID to close first, whether it's still wanted)
         self.launch_queue = queue.Queue()
         self.launches_pending = 0  # queued launches whose results haven't been handled yet
+        self.launching = set()  # user IDs queued or starting, so one can't be launched twice
+        self.launch_lock = threading.Lock()  # guards the two below, used by the launch threads
+        self.launch_waits = set()  # launch numbers of the launches still looking for their window
+        self.claimed_windows = set()  # PIDs already matched to a launch
         self.moved_windows = {}  # user ID -> (PID being replaced by a relaunch, it was hidden)
         self.rehide = set()  # PIDs to hide again once watching has restarted
         self.account_pids = {}  # user ID -> PID of the Roblox window launched for it
         # Follow event: accounts move to the private server that has the event.
         self.follow_on = self._saved_follow()
+        self.master_on = self._saved_master()  # the master switch: off stops everything
+        self.paused = threading.Event()  # set while it's off; the monitor thread reads it
+        if not self.master_on:
+            self.paused.set()
         self.follow_target = None  # link of the server the accounts have moved to
         self.follow_home = {}  # user ID -> link of the server it goes back to
         self.follow_quiet = set()  # names of the moved windows: the event's already been pinged
@@ -1607,30 +1697,41 @@ class App(QMainWindow):
         self.follow_noted = set()  # links and windows already explained in the feed
         self.follow_notes = []  # feed lines to show again after watching restarts
         self.follow_test = None  # TEMPORARY: Test follow's (window, its link, when it ends)
+        self.session = core.load_session()  # what Relaunch previous session opens again
+        self.session_new = True  # the next windows saved start a new record, not add to this one
+        self.session_begun = False  # this run has something worth saving over the last run's
+        self.session_restore = {}  # user ID -> its saved window, while it's being relaunched
         self.launcher = None
         self.watch_launched, self.auto_watch = {}, None  # launched windows to start watching
         self.watch_timer = QTimer(self)
         self.watch_timer.setSingleShot(True)
         self.watch_timer.setInterval(1500)
         self.watch_timer.timeout.connect(self._watch_launched)
-        # Own Roblox's one-window lock from the start, so every Roblox opened from now on
-        # (launched here or not) can run next to the others. Taking it from a Roblox that was
-        # open first takes a moment, so it runs off the UI thread, and is retried every few
-        # seconds until the app owns it (e.g. after another multi-Roblox tool closes).
+        # Have Roblox's one-window lock held from the start, so every Roblox opened from now on
+        # (launched here or not) can run next to the others. Starting its keeper takes a moment,
+        # so it runs off the UI thread, and it's checked again every few seconds.
         self.multi_roblox = False
         threading.Thread(target=self._keep_roblox_lock, daemon=True).start()
+        self.app_closing = {}  # Roblox PID -> why this app is closing it
+        watcher = core.WindowCloseWatcher(
+            lambda *closed: self.events.put(("window_closed", None, *closed)))
+        threading.Thread(target=watcher.run, daemon=True).start()
 
         self.setWindowTitle("Hallows' Eve Detector")
         if core.ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(core.ICON_PATH)))
-        self.setMinimumSize(900, 682)
+        self.setMinimumSize(900, 760)
         self._build()
         self._style_accounts()
         self._toggle_trim()  # starts the RAM trim timer (switch is on by default)
         self._style_follow()
+        self._style_master()
         self.follow_timer = QTimer(self)
         self.follow_timer.timeout.connect(self._follow_tick)
         self.follow_timer.start(1000)
+        self.session_timer = QTimer(self)
+        self.session_timer.timeout.connect(self._save_session)
+        self.session_timer.start(SESSION_SAVE_EVERY * 1000)
         self._restore_geometry()
         self.show_picker()
         self.timer = QTimer(self)
@@ -1676,14 +1777,29 @@ class App(QMainWindow):
         col.addSpacing(18)
 
         self.photo = ImageView(radius=14, focus=(0.72, 0.5))
-        self.photo.setFixedHeight(150)
+        self.photo.setMinimumHeight(48)  # the first thing to give way on a short screen
+        self.photo.setMaximumHeight(130)
+        self.photo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         if core.PHOTO_PATH.exists():
             self.photo.set_image(QImage(str(core.PHOTO_PATH)))
-        col.addWidget(self.photo)
-        col.addSpacing(14)
+        col.addWidget(self.photo, 1)
+        col.addSpacing(10)
+        master = QHBoxLayout()
+        master.setSpacing(10)
+        self.master_label = label("", "title")
+        master.addWidget(self.master_label, 1)
+        self.master_toggle = Toggle(self.master_on)
+        self.master_toggle.setToolTip("Master switch. Off stops everything the app does on its own: "
+                                      "detection, Discord pings, equipping, auto rebirth, Anti "
+                                      "Disconnect, Trim RAM and Follow event. On brings them back "
+                                      "with their switches as they were.")
+        self.master_toggle.clicked.connect(lambda *_: self._toggle_master())
+        master.addWidget(self.master_toggle)
+        col.addLayout(master)
+        col.addSpacing(8)
         self.status = Pill("Choose windows", MUTED, CARD_2)
         col.addWidget(self.status, 0, Qt.AlignLeft)
-        col.addSpacing(22)
+        col.addSpacing(16)
 
         head = QHBoxLayout()
         head.addWidget(label("WINDOWS", "section"))
@@ -1700,12 +1816,25 @@ class App(QMainWindow):
         head.addLayout(buttons)
         col.addLayout(head)
         col.addSpacing(6)
-        self.nav_box = QVBoxLayout()
-        self.nav_box.setSpacing(4)
-        col.addLayout(self.nav_box)
         self.nav_empty = label("Pick the Roblox windows to watch.", "small", wrap=True)
         col.addWidget(self.nav_empty)
-        col.addStretch(1)
+        # The list scrolls, so any number of windows fits without squeezing the sidebar.
+        nav_host = QWidget()
+        nav_host.setObjectName("navhost")
+        nav_host.setStyleSheet("QWidget#navhost { background: transparent; }")
+        self.nav_box = QVBoxLayout(nav_host)
+        self.nav_box.setContentsMargins(0, 0, 0, 0)
+        self.nav_box.setSpacing(4)
+        self.nav_box.setAlignment(Qt.AlignTop)
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setFrameShape(QFrame.NoFrame)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        nav_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        nav_scroll.viewport().setAutoFillBackground(False)
+        nav_scroll.setWidget(nav_host)
+        nav_scroll.setMinimumHeight(50)
+        col.addWidget(nav_scroll, 4)
 
         accts = QFrame()
         accts.setObjectName("stat")
@@ -1850,6 +1979,13 @@ class App(QMainWindow):
         except (OSError, ValueError, AttributeError):
             return False
 
+    @staticmethod
+    def _saved_master():
+        try:
+            return bool(json.loads(core.UI_SETTINGS_PATH.read_text()).get("detector_on", True))
+        except (OSError, ValueError, AttributeError):
+            return True
+
     def _restore_geometry(self):
         """Last session's window size and position (old 'WxH+X+Y' settings work too)."""
         try:
@@ -1879,7 +2015,8 @@ class App(QMainWindow):
                 # Also in the old form, so the Tkinter backup opens in the same place.
                 "geometry": f"{normal.width()}x{normal.height()}+{normal.x()}+{normal.y()}",
                 "maximized": self.isMaximized(),
-                "follow_event": self.follow_on}))
+                "follow_event": self.follow_on,
+                "detector_on": self.master_on}))
         except OSError:
             pass
 
@@ -2026,7 +2163,10 @@ class App(QMainWindow):
         """As many columns as fit (tiles at least ~300 px wide)."""
         if not self.tiles or not hasattr(self, "grid_host"):
             return
-        width = max(1, self.grid_host.width())
+        try:
+            width = max(1, self.grid_host.width())
+        except RuntimeError:  # the picker's page has gone: watching has started
+            return
         columns = max(1, min(3, width // 300))
         if columns == getattr(self, "grid_columns", 0) and self.grid.count() == len(self.tiles):
             return
@@ -2109,6 +2249,9 @@ class App(QMainWindow):
         QTimer.singleShot(0, self._layout_panels)
 
         self._log(f"Started watching {core.plural(len(selected), 'window')}.")
+        if not self.master_on:
+            self._show_all_off()
+            self._log("The detector is switched off (top left), so nothing happens in them yet.", "end")
         self._update_stats()
         self._watching_status()
 
@@ -2193,7 +2336,7 @@ class App(QMainWindow):
                          args=([(h, n) for h, n, _ in selected], self.interval, self.debug,
                                stop, on_status, on_change, self.notifier,
                                self.equipper, self.simulated, self.detecting,
-                               self.popups, self.rebirther, self.names)).start()
+                               self.popups, self.rebirther, self.names, self.paused)).start()
 
     def _build_panel(self, hwnd, name, pid, thumb):
         panel = QWidget()
@@ -2693,7 +2836,9 @@ class App(QMainWindow):
         widgets["server_hint"].setStyleSheet(f"color:{WARN};" if looks_wrong else "")
 
     def _watching_status(self):
-        if self.active:
+        if not self.master_on:
+            self._set_status("Everything off", DANGER, DANGER_SOFT)
+        elif self.active:
             self._set_status(f"Hallows' Eve in {core.plural(len(self.active), 'window')}",
                              ACCENT, ACCENT_SOFT)
         elif any(self.detecting.get(hwnd, True) for hwnd in self.rows):
@@ -2853,15 +2998,24 @@ class App(QMainWindow):
         return next((p for p in sorted(alive) if self.window_names.get(p) == name), None)
 
     def _launch_accounts(self, user_ids, relaunch=False, to_link=None, wanted=None):
-        """Queue launches; they run one after another, each waiting for its Roblox window so
-        the window can be told apart from the others (and given the account's name and its
-        private server link). `relaunch` closes the account's open window first. `to_link`
-        joins that server instead of the account's own; `wanted` is asked just before a launch
-        starts, and it's dropped if it says no."""
+        """Queue launches; up to LAUNCH_AT_ONCE run at the same time, each finding its own Roblox
+        window by its launch number (it gets the account's name and private server link).
+        `relaunch` closes the account's open window first; without it, an account already open
+        or starting is left alone, as a second window would kick the first out of the game.
+        `to_link` joins that server instead of the account's own; `wanted` is asked just before
+        a launch starts, and it's dropped if it says no."""
         for user_id in user_ids:
             account = self.accounts.get(user_id)
             if account is None:
                 continue
+            if user_id in self.launching:
+                continue  # its status line already says what's happening
+            if not relaunch:
+                pid = self.account_pid(user_id)
+                if pid is not None:
+                    self._set_account_status(user_id, f"Already open (PID {pid}), so not launched.",
+                                             WARN)
+                    continue
             server = self.accounts.server_of(account)
             link = to_link or (server["link"] if server else "")
             try:
@@ -2872,21 +3026,59 @@ class App(QMainWindow):
             except accounts.AccountError as e:
                 self._set_account_status(user_id, str(e), DANGER)
                 continue
-            self._set_account_status(user_id, "Waiting for the launch before it…"
-                                     if self.launch_queue.unfinished_tasks else "Starting…")
+            self._set_account_status(user_id, "Waiting for the launches before it…"
+                                     if self.launch_queue.unfinished_tasks >= LAUNCH_AT_ONCE
+                                     else "Starting…")
             close = self.account_pid(user_id) if relaunch else None
             if close is not None:
                 hwnd = next((h for h, w in self.rows.items() if w["pid"] == close), None)
                 self.moved_windows[user_id] = (close, hwnd is not None and core.is_hidden(hwnd))
             self.launches_pending += 1
-            self.launch_queue.put((user_id, cookie, link, account["name"], close, wanted))
+            self.launching.add(user_id)
+            why = "Follow event" if to_link else "Relaunch"
+            self.launch_queue.put((user_id, cookie, link, account["name"], close, wanted, why))
         if self.launcher is None:
-            self.launcher = threading.Thread(target=self._launch_worker, daemon=True)
-            self.launcher.start()
+            self.launcher = [threading.Thread(target=self._launch_worker, daemon=True)
+                             for _ in range(LAUNCH_AT_ONCE)]
+            for thread in self.launcher:
+                thread.start()
+
+    def _find_launched_window(self, tracker, before):
+        """The PID of the window started with this launch number, or None if none showed up in
+        time. Roblox's background tray process can take a launch over: it doesn't show the
+        number on its command line, so its log is read. If that doesn't tell yet, and this is
+        the only launch still looking and the only such window, it's this one."""
+        end = time.monotonic() + accounts.WINDOW_WAIT
+        while time.monotonic() < end:
+            unknown = []
+            for _, pid, _ in core.find_roblox_windows():
+                if pid in before:
+                    continue
+                with self.launch_lock:
+                    if pid in self.claimed_windows:
+                        continue
+                theirs = accounts.process_tracker(pid) or core.roblox_log_tracker(pid)
+                if theirs == tracker:
+                    unknown = [pid]
+                    break
+                if theirs is None:
+                    unknown.append(pid)
+            else:
+                with self.launch_lock:
+                    alone = len(self.launch_waits) == 1
+                if not (alone and len(unknown) == 1):
+                    time.sleep(WINDOW_CHECK_EVERY)
+                    continue
+            with self.launch_lock:
+                if unknown[0] not in self.claimed_windows:
+                    self.claimed_windows.add(unknown[0])
+                    return unknown[0]
+        return None
 
     def _launch_worker(self):
         while True:
-            user_id, cookie, link, name, close, wanted = self.launch_queue.get()
+            user_id, cookie, link, name, close, wanted, why = self.launch_queue.get()
+            tracker = accounts.new_tracker()
             try:
                 def post(text, color=MUTED):
                     self.events.put(("acct_status", None, user_id, text, color))
@@ -2897,26 +3089,30 @@ class App(QMainWindow):
                 if close is not None:
                     post("Closing the old Roblox window…")
                     hwnds = [h for h, p, _ in core.find_roblox_windows() if p == close]
-                    if not accounts.close_roblox(close, hwnds):
+                    self.app_closing[close] = why
+                    grace = FOLLOW_CLOSE_GRACE if why == "Follow event" else 15
+                    if not accounts.close_roblox(close, hwnds, timeout=grace):
+                        self.app_closing.pop(close, None)
                         raise accounts.AccountError(f"Couldn't close the old Roblox window "
                                                     f"(PID {close}). Close it, then click Launch.")
                     self.events.put(("acct_closed", None, user_id, close))
 
                 accounts.allow_multiple_roblox()  # quick once the app owns the lock
+                with self.launch_lock:
+                    self.launch_waits.add(tracker)
                 before = {pid for _, pid, _ in core.find_roblox_windows()}
-                accounts.launch(cookie, link, progress=post)
+                accounts.launch(cookie, link, progress=post, tracker=tracker)
                 post("Waiting for the Roblox window…")
-                pid, end = None, time.monotonic() + accounts.WINDOW_WAIT
-                while pid is None and time.monotonic() < end:
-                    time.sleep(1)
-                    pid = next((p for _, p, _ in core.find_roblox_windows() if p not in before), None)
-                self.events.put(("acct_window", None, user_id, name, link, pid))
+                self.events.put(("acct_window", None, user_id, name, link,
+                                 self._find_launched_window(tracker, before)))
             except accounts.AccountError as e:
                 post(str(e), DANGER)
             except Exception as e:  # never let one launch stop the ones after it
                 post(f"Unexpected problem: {e}", DANGER)
             finally:
-                self.events.put(("acct_done", None))
+                with self.launch_lock:
+                    self.launch_waits.discard(tracker)
+                self.events.put(("acct_done", None, user_id))
                 self.launch_queue.task_done()
 
     def _account_window(self, user_id, name, link, pid):
@@ -2933,6 +3129,10 @@ class App(QMainWindow):
         was_watched = old is not None and self._carry_window_settings(old, pid)
         if was_hidden:
             self.rehide.add(pid)
+        restored = self.session_restore.pop(user_id, None)
+        if restored:
+            self._apply_saved_window(pid, restored)
+            was_watched = True
         if pid not in self.window_names:
             self.window_names[pid] = core.clean_window_name(name)
             core.save_window_names(self.window_names)
@@ -2965,6 +3165,145 @@ class App(QMainWindow):
         if self.current_tab == old:
             self.current_tab = new
         return any(w["pid"] == old for w in self.rows.values())
+
+    # ------------------------------------------------------------------ previous session
+
+    def _accounts_by_pid(self, alive):
+        """{pid: user ID} of the open windows that belong to saved accounts."""
+        found = {}
+        for account in self.accounts.accounts:
+            pid = self.account_pids.get(account["id"])
+            if pid not in alive:
+                name = core.clean_window_name(account["name"])
+                pid = next((p for p in sorted(alive) if self.window_names.get(p) == name), None)
+            if pid is not None:
+                found[pid] = account["id"]
+        return found
+
+    def _save_session(self):
+        """Remember the watched windows of saved accounts, with their switches. A window that
+        closes stays in the record, so a crash doesn't forget it; one still open but no longer
+        watched is dropped. Once every window has gone, the next ones start a new record."""
+        alive = {pid for _, pid, _ in core.find_roblox_windows()}
+        if not alive:
+            self.session_new = True
+            return
+        if not self.rows or self.launches_pending or self.watch_launched or self.session_restore:
+            return  # windows are on the move; a restart of watching follows
+        users = self._accounts_by_pid(alive)
+        windows, others = [], []
+        for hwnd, widgets in self.rows.items():
+            pid = widgets["pid"]
+            if pid not in alive:
+                continue
+            user_id = users.get(pid)
+            if user_id is None:
+                others.append(widgets["label"])
+                continue
+            windows.append({
+                "id": user_id, "name": self.accounts.get(user_id)["name"], "label": widgets["label"],
+                # A window moved by Follow event belongs in the server it came from.
+                "link": self.follow_home.get(user_id)
+                or self.private_servers.get(pid, "").strip(),
+                "slots": list(self.slots.get(hwnd, [])), "rebirth": bool(self.rebirth_on.get(hwnd)),
+                "detect": self.detecting.get(hwnd, True),
+                "anti_disconnect": self.anti_disconnect.get(hwnd, True),
+                "hidden": core.is_hidden(hwnd)})
+        if not windows:
+            return
+        # Windows just opened with nothing changed yet mustn't wipe what the last run saved:
+        # those switches all start off, and bringing them back is what the button is for.
+        if not self.session_begun:
+            self.session_begun = bool(self.account_pids) or any(
+                w["slots"] or w["rebirth"] or not w["detect"] or not w["anti_disconnect"]
+                for w in windows)
+            if not self.session_begun:
+                return
+        if not self.session_new:
+            listed = {w["id"] for w in windows}
+            windows += [w for w in self.session.get("windows", [])
+                        if w["id"] not in listed and w["id"] not in users.values()
+                        and self.accounts.get(w["id"]) is not None]
+        session = {"windows": windows, "others": others, "trim": self.trim_toggle.isChecked(),
+                   "discord": self.discord_on}
+        self.session_new = False
+        if session != {k: v for k, v in self.session.items() if k != "saved"}:
+            self.session = dict(session, saved=time.strftime("%Y-%m-%d %H:%M"))
+            core.save_session(self.session)
+            dialog = self._accounts_window()
+            if dialog is not None:
+                dialog.show_session()
+
+    def _apply_saved_window(self, pid, saved):
+        """Give a Roblox process a saved window's name and switches; they're read from these
+        when watching (re)starts."""
+        self.session_slots[pid] = list(saved.get("slots", []))
+        (self.session_rebirth.add if saved.get("rebirth") else self.session_rebirth.discard)(pid)
+        (self.session_detect_off.discard if saved.get("detect", True)
+         else self.session_detect_off.add)(pid)
+        (self.session_anti_off.discard if saved.get("anti_disconnect", True)
+         else self.session_anti_off.add)(pid)
+        if saved.get("hidden"):
+            self.rehide.add(pid)
+        if saved.get("label"):
+            self.window_names[pid] = saved["label"]
+            core.save_window_names(self.window_names)
+
+    def _session_note(self, text, tag=None):
+        self._log(text, tag)
+        dialog = self._accounts_window()
+        if dialog is not None:
+            dialog.show_note(text, WARN if tag == "error" else MUTED)
+
+    def _relaunch_session(self):
+        """Open the saved windows again, each in its own server, with their switches. Windows
+        still open aren't touched, they just get their switches back."""
+        if self.launches_pending or self.follow_target or self.follow_test:
+            self._session_note("Previous session: wait for the current launch or Follow event "
+                               "to finish.", "error")
+            return
+        alive = {pid for _, pid, _ in core.find_roblox_windows()}
+        pid_of = {user_id: pid for pid, user_id in self._accounts_by_pid(alive).items()}
+        launching, kept, missing = [], [], []
+        for saved in self.session.get("windows", []):
+            user_id = saved["id"]
+            if self.accounts.get(user_id) is None:
+                missing.append(saved["name"])
+            elif user_id in pid_of:
+                pid = pid_of[user_id]
+                self._apply_saved_window(pid, saved)
+                self.watch_launched[pid] = saved["name"]
+                kept.append(saved["name"])
+            else:
+                launching.append(saved)
+        # From here on the record stays as it is until these are open.
+        self.session_new, self.session_begun = False, True
+        trim, discord = self.session.get("trim"), self.session.get("discord")
+        if trim is not None and trim != self.trim_toggle.isChecked():
+            self.trim_toggle.setChecked(trim)
+            self._toggle_trim()
+        if discord is not None:
+            self.discord_on = discord
+            if self.notifier:
+                self.notifier.enabled = discord
+            self._style_discord()
+        for saved in launching:
+            self.session_restore[saved["id"]] = saved
+            self._launch_accounts([saved["id"]], to_link=saved.get("link") or None)
+        if not self.launches_pending:  # none could be queued: _launch_accounts said why
+            self.session_restore = {}
+        if self.watch_launched:
+            self.watch_timer.start()
+        parts = []
+        if launching:
+            parts.append("reopening " + ", ".join(f"@{w['name']}" for w in launching))
+        if kept:
+            parts.append("settings back on " + ", ".join(f"@{n}" for n in kept) + ", already open")
+        if missing:
+            parts.append(", ".join(f"@{n}" for n in missing) + " isn't a saved account any more")
+        if self.session.get("others"):
+            parts.append(", ".join(self.session["others"]) + " can't be reopened: not a saved account")
+        self._session_note("Previous session: " + "; ".join(parts or ["nothing to reopen"]) + ".")
 
     def _refresh_windows(self):
         """Look for Roblox windows again. While watching: keep watching the same windows,
@@ -3023,6 +3362,20 @@ class App(QMainWindow):
             except RuntimeError:
                 self.show_picker()
 
+    def _window_closed(self, pid, ran_for, kind, text, last_active):
+        """A Roblox window's process ended: note why in the feed and in window_closes.csv."""
+        why = self.app_closing.pop(pid, None)
+        if why:
+            kind, text = "detector", f"Closed by this app ({why})"
+        name = self.window_names.get(pid) or f"PID {pid}"
+        ran = core.fmt_span(ran_for)
+        core.record_window_close(name, pid, ran, kind, text, last_active,
+                                 self.trim_toggle.isChecked())
+        active = (f" Last active {time.strftime('%H:%M:%S', time.localtime(last_active))}."
+                  if kind == "froze" and last_active else "")
+        self._log(f"Window closed: {name} (ran {ran}). {text}.{active}",
+                  None if kind in ("closed", "detector") else "error")
+
     def _keep_roblox_lock(self):
         while True:
             try:
@@ -3043,6 +3396,9 @@ class App(QMainWindow):
             core.save_private_servers(self.private_servers)
         elif kind == "acct_done":
             self.launches_pending -= 1
+            self.launching.discard(data[0])
+            if not self.launches_pending:
+                self.session_restore = {}  # any left couldn't be opened; the status says why
         elif kind == "acct_dropped":
             self.moved_windows.pop(data[0], None)
             self._set_account_status(data[0], "Stayed in its server: the event was ending.")
@@ -3077,6 +3433,37 @@ class App(QMainWindow):
 
     # ------------------------------------------------------------------ follow the event
 
+    def _toggle_master(self):
+        """The master switch: everything the app does on its own stops, or carries on. Each
+        window's and each feature's own switch stays as it is, ready for when it's back on."""
+        self.master_on = self.master_toggle.isChecked()
+        (self.paused.clear if self.master_on else self.paused.set)()
+        self._save_geometry()
+        self._style_master()
+        if self.master_on:
+            self._log("Detector on: everything is running again, with your switches as they were.",
+                      "start")
+        else:
+            self._show_all_off()
+            self._log("Detector off: no detection, pings, equipping, auto rebirth, Anti Disconnect, "
+                      "RAM trims or Follow event until it's switched back on. Your Roblox windows "
+                      "stay open.", "end")
+        if self.rows:
+            self._watching_status()
+
+    def _style_master(self):
+        self.master_label.setText("Detector on" if self.master_on else "Detector off")
+        self.master_label.setStyleSheet("" if self.master_on else f"color:{DANGER};")
+
+    def _show_all_off(self):
+        """Nothing's being checked now, so no window can claim to have the event."""
+        for hwnd, widgets in self.rows.items():
+            self._apply_status(hwnd, False, None, None)
+            widgets["badge"].set("Detector off", DANGER, DANGER_SOFT)
+            widgets["nav"].sub.setText("Off")
+        self.follow_since = {}
+        self._update_stats()
+
     def _toggle_follow(self):
         self.follow_on = self.follow_toggle.isChecked()
         self._save_geometry()
@@ -3106,7 +3493,9 @@ class App(QMainWindow):
         this window's server has the event. No Discord ping, like any test event."""
         name = self.rows[hwnd]["label"]
         link = self._window_link(hwnd)
-        if not link:
+        if not self.master_on:
+            self._log("Test follow: the detector is switched off (top left).", "error")
+        elif not link:
             self._log(f"Test follow: {name} has no private server link.", "error")
         elif self.follow_test or self.follow_target or self.launches_pending:
             self._log("Test follow: wait for the current move or launch to finish.", "error")
@@ -3135,7 +3524,10 @@ class App(QMainWindow):
     def _follow_tick(self):
         """Every second: while accounts have moved, watch for the event ending there; otherwise
         look for a window showing the event, to move them to its server. Moves wait for any
-        launch in progress, whose window isn't known yet."""
+        launch in progress, whose window isn't known yet. Nothing moves while the detector is off;
+        accounts moved before that go back once it's on again."""
+        if not self.master_on:
+            return
         now = time.monotonic()
         test_link = self._apply_follow_test(now)  # TEMPORARY
         real = {h for h in self.active if h in self.rows and (
@@ -3163,7 +3555,7 @@ class App(QMainWindow):
     def _follow_wanted(self, link):
         """Is a queued move to this server still worth doing? (Asked on the launch thread.)"""
         until = self.follow_until
-        return (self.follow_target == link and not self.follow_over
+        return (self.master_on and self.follow_target == link and not self.follow_over
                 and (until is None or until - time.monotonic() > FOLLOW_MIN_LEFT / 2))
 
     def _follow_start(self, now, real):
@@ -3190,12 +3582,15 @@ class App(QMainWindow):
                 self._log(f"Follow event: {core.fmt_clock(left)} left in "
                           f"{self._server_name(link)}, too little to move accounts there.", "end")
                 continue
-            home = {}
+            home, no_slots = {}, []
             for account in self.accounts.accounts:
                 pid = self.account_pid(account["id"])
                 current = self.private_servers.get(pid, "").strip() if pid is not None else ""
                 if pid is None or current == link or current in links:
                     continue  # no window open, or already in a server with the event
+                if not self.session_slots.get(pid):
+                    no_slots.append(account["name"])  # nothing to equip, so nothing to gain
+                    continue
                 saved = self.accounts.server_of(account)
                 back = current or (saved["link"] if saved else "")
                 if back:
@@ -3204,11 +3599,17 @@ class App(QMainWindow):
                     self._log(f"Follow event: @{account['name']} stays put: there's no "
                               "server to bring it back to.", "end")
             self.follow_noted.add(link)
+            if no_slots:
+                # With a move coming, watching restarts with a new feed, so it's shown again.
+                (self._follow_log if home else self._log)(
+                    "Follow event: " + ", ".join(f"@{n}" for n in no_slots)
+                    + (" stays" if len(no_slots) == 1 else " stay")
+                    + " put: no characters selected.", "end")
             if home:
                 self._follow_move(link, left, home, self.rows[hwnd]["label"], now)
             elif self.follow_test:  # TEMPORARY
-                self._log("Test follow: no saved account has a window open in another server, "
-                          "so there's nobody to move.", "end")
+                self._log("Test follow: no saved account with characters selected has a window "
+                          "open in another server, so there's nobody to move.", "end")
             return
 
     def _follow_move(self, link, left, home, source, now):
@@ -3266,7 +3667,7 @@ class App(QMainWindow):
 
     def _trim_ram(self):
         """Same as the F6 hotkey: trim every Roblox client's memory (on a worker thread)."""
-        if self.trim_busy:
+        if self.trim_busy or not self.master_on:
             return
         self.trim_busy = True
 
@@ -3393,6 +3794,9 @@ class App(QMainWindow):
                 if kind == "trim_done":
                     self._trim_done(*data)
                     continue
+                if kind == "window_closed":
+                    self._window_closed(*data)
+                    continue
                 if kind.startswith("acct_"):
                     if kind == "acct_signed_in":
                         self.signin = None
@@ -3405,6 +3809,8 @@ class App(QMainWindow):
                     continue
                 if kind == "windows":
                     self._show_windows(*data)
+                elif kind in ("status", "change") and not self.master_on:
+                    pass  # checked just before it was switched off
                 elif kind == "status":
                     self._apply_status(*data)
                 elif kind == "change":
@@ -3450,6 +3856,8 @@ class App(QMainWindow):
         self._closed = True
         self.timer.stop()
         self.trim_timer.stop()
+        self.session_timer.stop()
+        self._save_session()
         self._save_geometry()
         self._close_slot_picker()
         self._close_log_windows()

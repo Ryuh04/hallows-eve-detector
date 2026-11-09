@@ -47,6 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import mss
@@ -174,6 +175,195 @@ def trim_roblox_memory():
                 trimmed += 1
             kernel32.CloseHandle(handle)
     return len(pids), trimmed
+
+
+# --------------------------------------------------------------------------- #
+# Why a Roblox window closed
+# --------------------------------------------------------------------------- #
+
+ROBLOX_LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Roblox" / "logs"
+WINDOW_CLOSES_PATH = APP_DIR / "window_closes.csv"  # every Roblox window that closed, and why
+WINDOW_CLOSES_HEADER = "closed,window,pid,ran_for,kind,what_happened,last_active,trim_ram_on"
+LOG_NAME_RE = re.compile(r"_(\d{8}T\d{6})Z_Player_[0-9A-Fa-f]+(?:_last)?\.log$")  # not CrashHandler
+LOG_NAME_LATEST = 20  # a client names its log within this many seconds of starting
+LOG_NAME_USUAL = 2.5  # how many seconds that usually is
+LOG_NAME_CLEAR = 1.5  # how much better the best fit must be than the next, in seconds
+LOG_TAIL = 1_000_000  # bytes read from the end of a log; they can reach tens of MB
+LOG_LAST_WORDS = 60  # seconds before a log's end that still count as why it ended
+DISCONNECT_RE = re.compile(rb"Disconnected from server for reason:.*\(([A-Za-z]{1,60})\)")
+LOG_TIME_RE = re.compile(rb"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)")
+LOG_TRACKER_RE = re.compile(rb"web launch, websiteBTId is (\d+)")
+
+
+def process_start(pid):
+    """When a running process started (Unix time), or None if it has ended. Together with
+    the PID this tells a process apart from a later one given the same PID."""
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        # An ended process can still be opened while something holds a handle to it.
+        code = wt.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+            return None
+        times = [wt.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        return ((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime) / 1e7 - 11644473600
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+kernel32.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
+
+
+def find_roblox_log(started):
+    """The log of the Roblox client that started at `started`. Logs don't say which process
+    wrote them, but the name holds when the client began logging, usually 2-3 seconds after
+    it started. None if there's no such log, or two fit about equally (clients started within
+    about 3 seconds of each other): no answer beats another window's reason."""
+    fits = []
+    try:
+        paths = list(ROBLOX_LOG_DIR.glob("*_Player_*.log"))
+    except OSError:
+        return None
+    for path in paths:
+        match = LOG_NAME_RE.search(path.name)
+        if not match:
+            continue
+        named = datetime.strptime(match[1], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        gap = named.timestamp() - started
+        if -1 <= gap <= LOG_NAME_LATEST:
+            fits.append((abs(gap - LOG_NAME_USUAL), path))
+    fits.sort(key=lambda fit: fit[0])
+    if not fits or (len(fits) > 1 and fits[1][0] - fits[0][0] < LOG_NAME_CLEAR):
+        return None
+    return fits[0][1]
+
+
+def roblox_log_tracker(pid):
+    """The launch number (accounts.new_tracker) a Roblox process's log says it was launched
+    with, or None. For Roblox's background tray process, which takes over a launch without it
+    showing on its command line."""
+    started = process_start(pid)
+    path = find_roblox_log(started) if started is not None else None
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - LOG_TAIL))
+            found = LOG_TRACKER_RE.findall(f.read())
+    except OSError:
+        return None
+    return found[-1].decode() if found else None
+
+
+def _log_time(line):
+    match = LOG_TIME_RE.match(line)
+    if not match:
+        return None
+    return (datetime.strptime(match[1].decode(), "%Y-%m-%dT%H:%M:%S")
+            .replace(tzinfo=timezone.utc).timestamp())
+
+
+def roblox_exit_reason(path):
+    """What a client's log says about how it ended: (kind, text, last active). Kind is froze,
+    closed, disconnected or ended; last active is the time of its last session heartbeat, or
+    None. Only these are taken from the log, never whole lines, as logs can hold private data."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - LOG_TAIL))
+            lines = f.read().splitlines()
+    except OSError:
+        return "ended", "Ended, but Roblox's log couldn't be read", None
+    end, said, active = None, None, None
+    for line in reversed(lines):
+        at = _log_time(line)
+        if at is None:
+            continue
+        end = end or at
+        recent = end - at <= LOG_LAST_WORDS
+        if said is None and recent:
+            disconnect = DISCONNECT_RE.search(line)
+            if b"hanging past timeout" in line:
+                said = "froze", "Froze, so Roblox ended it"
+            elif disconnect and disconnect[1] != b"DisconnectClientInitiated":
+                said = "disconnected", f"Disconnected from the server ({disconnect[1].decode()})"
+            elif disconnect or b"User exit app" in line:
+                said = "closed", "Closed normally (the X button, Leave, or another program)"
+        if active is None and (b"onSessionHeartbeat" in line or b"onSessionChange" in line):
+            active = at
+        if active is not None and (said is not None or not recent):
+            break
+    said = said or ("ended", "Ended with no reason in Roblox's log (a crash, Task Manager or "
+                             "the PC shutting down)")
+    return said[0], said[1], active
+
+
+def record_window_close(window, pid, ran_for, kind, text, last_active, trim_on):
+    """Add a closed window to WINDOW_CLOSES_PATH."""
+    stamp = "%Y-%m-%d %H:%M:%S"
+    try:
+        new = not WINDOW_CLOSES_PATH.exists()
+        with WINDOW_CLOSES_PATH.open("a", encoding="utf-8", newline="") as f:
+            if new:
+                f.write(WINDOW_CLOSES_HEADER + "\n")
+            csv.writer(f, lineterminator="\n").writerow(
+                [time.strftime(stamp), window, pid, ran_for, kind, text,
+                 time.strftime(stamp, time.localtime(last_active)) if last_active else "",
+                 "yes" if trim_on else "no"])
+    except OSError:
+        pass
+
+
+def fmt_span(seconds):
+    minutes = int(seconds) // 60
+    return f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
+
+
+class WindowCloseWatcher:
+    """Notices when the process of a Roblox window ends, whether or not the window was being
+    watched, and calls on_close(pid, ran for in seconds, kind, text, last active).
+
+    It goes by the process, not the window: Roblox's background tray process has no window
+    and restarts itself every few hours, so it's only followed once it has shown one."""
+
+    SETTLE = 3  # seconds after a process ends before its log is read (the end still being written)
+
+    def __init__(self, on_close):
+        self.on_close = on_close
+        self.clients = {}  # pid -> when its process started
+        self.ended = []  # (when to read the log, pid, when it started, when it ended)
+
+    def check(self):
+        now = time.time()
+        for _, pid, _ in find_roblox_windows():
+            if pid not in self.clients:
+                started = process_start(pid)
+                if started is not None:
+                    self.clients[pid] = started
+        for pid, started in list(self.clients.items()):
+            if process_start(pid) != started:
+                del self.clients[pid]
+                self.ended.append((now + self.SETTLE, pid, started, now))
+        for item in [e for e in self.ended if e[0] <= now]:
+            self.ended.remove(item)
+            _, pid, started, ended = item
+            path = find_roblox_log(started)
+            kind, text, active = (roblox_exit_reason(path) if path else
+                                  ("ended", "Ended, and no Roblox log could be matched to it", None))
+            self.on_close(pid, ended - started, kind, text, active)
+
+    def run(self, every=3):
+        while True:
+            try:
+                self.check()
+            except Exception as e:  # keep watching; this must never stop the app
+                print(f"Window close watcher: {e}", flush=True)
+            time.sleep(every)
 
 
 class WindowStream:
@@ -1879,6 +2069,25 @@ UI_SETTINGS_PATH = APP_DIR / "ui_settings.json"  # remembered window size and po
 PRIVATE_SERVERS_PATH = APP_DIR / "private_servers.json"  # private server links, by Roblox process ID
 WINDOW_NAMES_PATH = APP_DIR / "window_names.json"  # names given to windows, by Roblox process ID
 NO_PING_PATH = APP_DIR / "no_ping.json"  # names of windows (accounts) that detect but don't ping
+SESSION_PATH = APP_DIR / "previous_session.json"  # the windows last open and their switches
+
+
+def load_session():
+    """What Relaunch previous session reopens: {"windows": [...], ...}; empty if there's none."""
+    try:
+        session = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
+        return session if isinstance(session, dict) and isinstance(session.get("windows"), list) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session(session):
+    try:
+        temp = SESSION_PATH.with_name(SESSION_PATH.name + ".tmp")
+        temp.write_text(json.dumps(session, indent=1), encoding="utf-8")
+        os.replace(temp, SESSION_PATH)
+    except OSError:
+        pass
 
 
 def load_window_names():
@@ -2200,8 +2409,9 @@ class DiscordNotifier:
 
 def monitor(selected, interval, debug, stop, on_status=None, on_change=None, notifier=None,
             equipper=None, simulated=None, detecting=None, popups=None, rebirther=None,
-            names=None):
-    """Check every selected window each `interval` seconds until `stop` is set.
+            names=None, paused=None):
+    """Check every selected window each `interval` seconds until `stop` is set. While `paused`
+    is set (an Event: the app's master switch), nothing at all is done with the windows.
 
     on_status(hwnd, active, seconds_left, image, mutated, slots) runs every check
     (active and image are None when the window can't be captured; `slots` is the
@@ -2227,6 +2437,9 @@ def monitor(selected, interval, debug, stop, on_status=None, on_change=None, not
         DEBUG_DIR.mkdir(exist_ok=True)
     sct = open_screen()
     while not stop.is_set():
+        if paused is not None and paused.is_set():
+            stop.wait(interval)
+            continue
         started = time.perf_counter()
         showing = []
         for hwnd, label in selected:

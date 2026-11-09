@@ -230,17 +230,65 @@ def launch_uri(ticket, place_id, link_code=None, tracker=None):
             + "+LaunchExp:InApp")
 
 
-def launch(cookie, link, progress=lambda text: None, opener=None, start=None):
-    """Start Roblox as this account, joining the server the link points at."""
+def new_tracker():
+    """A number for one launch. Roblox shows it on its command line and in its log, which is
+    how a window is told apart when several open at the same time."""
+    return str(random.randint(10 ** 11, 10 ** 12 - 1))
+
+
+def process_tracker(pid):
+    """The launch number a Roblox process was started with, or None if it has none (like
+    Roblox's background tray process). The command line also holds the account's join ticket,
+    so only the number leaves this function."""
+    handle = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(1 << 16)
+        needed = wt.ULONG()
+        if _ntdll.NtQueryInformationProcess(handle, 60, buf, len(buf),  # ProcessCommandLineInformation
+                                            ctypes.byref(needed)) != 0:
+            return None
+        length = ctypes.c_ushort.from_buffer(buf).value
+        address = ctypes.c_void_p.from_buffer(buf, 8).value
+        if not address or not length:
+            return None
+        found = TRACKER_RE.search(ctypes.wstring_at(address, length // 2))
+        return found[1] if found else None
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+TRACKER_RE = re.compile(r"browsertrackerid:(\d+)")
+SHARE_KEEP = 600  # seconds a private server link's lookup is remembered
+_share_lookups = {}  # share code -> (when looked up, place ID, link code)
+_share_lock = threading.Lock()
+
+
+def _resolve_share_once(session, code):
+    """resolve_share, remembered for a while: every account launching into the same server
+    needs the same answer. One at a time, so launches starting together ask only once."""
+    with _share_lock:
+        known = _share_lookups.get(code)
+        if known and time.monotonic() - known[0] < SHARE_KEEP:
+            return known[1], known[2]
+        place_id, link_code = resolve_share(session, code)
+        _share_lookups[code] = (time.monotonic(), place_id, link_code)
+        return place_id, link_code
+
+
+def launch(cookie, link, progress=lambda text: None, opener=None, start=None, tracker=None):
+    """Start Roblox as this account, joining the server the link points at. `tracker` is this
+    launch's number (see new_tracker)."""
     target = parse_server_link(link)
     session = RobloxSession(cookie, opener)
     if "share" in target:
         progress("Reading the private server link…")
-        place_id, link_code = resolve_share(session, target["share"])
+        place_id, link_code = _resolve_share_once(session, target["share"])
     else:
         place_id, link_code = target["place_id"], target["link_code"]
     progress("Getting a join ticket…")
-    uri = launch_uri(auth_ticket(session), place_id, link_code)
+    uri = launch_uri(auth_ticket(session), place_id, link_code, tracker)
     progress("Starting Roblox…")
     try:
         (start or os.startfile)(uri)
@@ -373,6 +421,13 @@ class AccountStore:
             account["watch"] = on
             self.save()
 
+    def set_ticked(self, user_id, on):
+        """Whether the account is ticked for Launch selected."""
+        account = self.get(user_id)
+        if account is not None and bool(account.get("ticked")) != on:
+            account["ticked"] = on
+            self.save()
+
     def remove(self, user_id):
         self.accounts = [a for a in self.accounts if a["id"] != user_id]
         self.save()
@@ -391,155 +446,87 @@ class AccountStore:
 
 _kernel32.CreateMutexW.restype = wt.HANDLE
 _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
-_kernel32.CreateEventW.restype = wt.HANDLE
-_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.BOOL, wt.LPCWSTR]
+_kernel32.OpenMutexW.restype = wt.HANDLE
+_kernel32.OpenMutexW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
+_kernel32.OpenEventW.restype = wt.HANDLE
+_kernel32.OpenEventW.argtypes = [wt.DWORD, wt.BOOL, wt.LPCWSTR]
 _kernel32.OpenProcess.restype = wt.HANDLE
 _kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
-_kernel32.GetCurrentProcess.restype = wt.HANDLE
-_kernel32.DuplicateHandle.argtypes = [wt.HANDLE, wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.HANDLE),
-                                      wt.DWORD, wt.BOOL, wt.DWORD]
 _kernel32.CloseHandle.argtypes = [wt.HANDLE]
 _ntdll = ctypes.WinDLL("ntdll")
-_ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wt.ULONG,
-                                            ctypes.POINTER(wt.ULONG)]
-_ntdll.NtQueryObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
-                                 ctypes.POINTER(wt.ULONG)]
-_held = []
+_ntdll.NtQueryInformationProcess.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+                                             ctypes.POINTER(wt.ULONG)]
 _lock = threading.Lock()
-ERROR_ALREADY_EXISTS = 183
-SINGLETON_NAMES = ("ROBLOX_singletonMutex", "ROBLOX_singletonEvent")
+_app_open = None  # handle whose name tells the keeper this app is open
+SYNCHRONIZE = 0x00100000
+KEEPER_NAME = "HallowsEve_RobloxLockKeeper"
+KEEPER_OWNS_NAME = "HallowsEve_RobloxLockOwned"
+APP_OPEN_NAME = "HallowsEve_DetectorOpen"
+KEEPER_WAIT = 15  # seconds a just-started keeper gets to take the lock
+# Roblox clients watch the lock all the time. If whoever holds it goes away, or it's pulled out
+# from under them, they take it that a newer Roblox has started and close themselves. So it's held
+# by this little background process, which outlives the app and is never taken from anyone: it goes
+# once the app and all Roblox windows have been gone for a while.
+KEEPER_SCRIPT = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$single = New-Object Threading.Mutex($false, '{KEEPER_NAME}')
+try {{ if (-not $single.WaitOne(0)) {{ exit }} }} catch [Threading.AbandonedMutexException] {{ }}
+$owns = New-Object Threading.EventWaitHandle($false, 'ManualReset', '{KEEPER_OWNS_NAME}')
+$have = $false
+$lock = New-Object Threading.Mutex($true, 'ROBLOX_singletonMutex', [ref]$have)
+$event = New-Object Threading.EventWaitHandle($false, 'ManualReset', 'ROBLOX_singletonEvent')
+$idle = 0
+while ($true) {{
+  if (-not $have) {{ try {{ $have = $lock.WaitOne(0) }} catch [Threading.AbandonedMutexException] {{ $have = $true }} }}
+  if ($have) {{ [void]$owns.Set() }}
+  Start-Sleep -Seconds 3
+  $app = $false
+  try {{ [Threading.Mutex]::OpenExisting('{APP_OPEN_NAME}').Close(); $app = $true }} catch {{ }}
+  $windows = @(Get-Process RobloxPlayerBeta | Where-Object {{ $_.MainWindowHandle -ne 0 }}).Count -gt 0
+  if ($app -or $windows) {{ $idle = 0 }} else {{ $idle += 1; if ($idle -ge 5) {{ break }} }}
+}}
+if ($have) {{ $lock.ReleaseMutex() }}
+"""
 
 
-class _HandleEntry(ctypes.Structure):  # SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX
-    _fields_ = [("Object", ctypes.c_void_p), ("UniqueProcessId", ctypes.c_size_t),
-                ("HandleValue", ctypes.c_size_t), ("GrantedAccess", wt.ULONG),
-                ("CreatorBackTraceIndex", wt.USHORT), ("ObjectTypeIndex", wt.USHORT),
-                ("HandleAttributes", wt.ULONG), ("Reserved", wt.ULONG)]
-
-
-def _roblox_pids():
-    out = subprocess.run(["tasklist", "/fi", "imagename eq RobloxPlayerBeta.exe", "/fo", "csv", "/nh"],
-                         capture_output=True, text=True, creationflags=0x08000000).stdout
-    pids = set()
-    for line in out.splitlines():
-        parts = line.strip().strip('"').split('","')
-        if len(parts) > 1 and parts[1].isdigit():
-            pids.add(int(parts[1]))
-    return pids
-
-
-def _object_text(handle, info_class):
-    """An object's type (info_class 2) or name (1). Names are only asked for mutexes and
-    events: asking a pipe's name can hang."""
-    buf = ctypes.create_string_buffer(4096)
-    if _ntdll.NtQueryObject(handle, info_class, buf, 4096, None) != 0:
-        return None
-    length = ctypes.c_ushort.from_buffer(buf).value
-    ptr = ctypes.c_void_p.from_buffer(buf, 8).value
-    return ctypes.wstring_at(ptr, length // 2) if ptr else ""
-
-
-def close_roblox_singletons():
-    """Close Roblox's single-instance mutex and event inside the running Roblox clients
-    (what Roblox Account Manager does), so the app can own them. Returns how many it closed."""
-    pids = _roblox_pids()
-    if not pids:
-        return 0
-    size = 1 << 22
-    while True:
-        buf = ctypes.create_string_buffer(size)
-        needed = wt.ULONG()
-        status = _ntdll.NtQuerySystemInformation(64, buf, size, ctypes.byref(needed)) & 0xFFFFFFFF
-        if status == 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH
-            size = max(size * 2, needed.value + (1 << 16))
-            continue
-        if status != 0:
-            return 0
-        break
-    count = ctypes.c_size_t.from_buffer(buf).value
-    entries = (_HandleEntry * count).from_buffer(buf, 2 * ctypes.sizeof(ctypes.c_size_t))
-    me, closed, types = _kernel32.GetCurrentProcess(), 0, {}
-    procs = {pid: _kernel32.OpenProcess(0x0040, False, pid) for pid in pids}  # PROCESS_DUP_HANDLE
-    try:
-        for entry in entries:
-            proc = procs.get(entry.UniqueProcessId)
-            if not proc or types.get(entry.ObjectTypeIndex, "Mutant") not in ("Mutant", "Event"):
-                continue
-            dup = wt.HANDLE()
-            if not _kernel32.DuplicateHandle(proc, entry.HandleValue, me, ctypes.byref(dup), 0,
-                                             False, 2):  # DUPLICATE_SAME_ACCESS
-                continue
-            kind = types.setdefault(entry.ObjectTypeIndex, _object_text(dup, 2))
-            name = _object_text(dup, 1) if kind in ("Mutant", "Event") else None
-            _kernel32.CloseHandle(dup)
-            if name and name.rsplit("\\", 1)[-1] in SINGLETON_NAMES:
-                if _kernel32.DuplicateHandle(proc, entry.HandleValue, None, None, 0, False,
-                                             1):  # DUPLICATE_CLOSE_SOURCE
-                    closed += 1
-    finally:
-        for proc in procs.values():
-            if proc:
-                _kernel32.CloseHandle(proc)
-    return closed
-
-
-def _take_roblox_lock():
-    """One try at owning the mutex and event (on the keeper thread). True once owned."""
-    if _held and _held[0][1]:
-        return True
-    for handle, _ in _held:
-        _kernel32.CloseHandle(handle)
-    _held.clear()
-    made = False
-    for attempt in range(2):
-        handle = _kernel32.CreateMutexW(None, True, SINGLETON_NAMES[0])
-        made = ctypes.get_last_error() != ERROR_ALREADY_EXISTS
-        if made or attempt or not handle:
-            break
-        _kernel32.CloseHandle(handle)  # someone else's: close theirs in Roblox, try again
-        if not close_roblox_singletons():
-            handle = _kernel32.CreateMutexW(None, True, SINGLETON_NAMES[0])
-            break
-    event = _kernel32.CreateEventW(None, True, False, SINGLETON_NAMES[1])
+def _named_object_open(opener, name):
+    handle = opener(SYNCHRONIZE, False, name)
     if handle:
-        _held.append((handle, made))
-    if event:
-        _held.append((event, made))
-    return made
+        _kernel32.CloseHandle(handle)
+    return bool(handle)
 
 
-def _keep_roblox_lock(first_try):
-    """The thread that owns the mutex. It never ends: a mutex whose owning thread ends is
-    'abandoned', and the next Roblox to wait for it takes it over and closes the others."""
-    while True:
-        with _lock:
-            owned = _take_roblox_lock()
-        first_try.set()
-        if not owned:
-            time.sleep(5)  # another tool holds it; take over once it lets go
-            continue
-        time.sleep(3600)
+def _keeper_owns_lock():
+    handle = _kernel32.OpenEventW(SYNCHRONIZE, False, KEEPER_OWNS_NAME)
+    if not handle:
+        return False
+    try:
+        return _kernel32.WaitForSingleObject(handle, 0) == 0
+    finally:
+        _kernel32.CloseHandle(handle)
 
 
-_keeper = None
-
-
-def allow_multiple_roblox(wait=10):
-    """Own Roblox's single-instance mutex (and event) for as long as the app runs, so every
-    Roblox opened from then on stays open next to the others. If a Roblox that was open
-    before the app owns them, its handles are closed first so the app can take them over.
-    The lock is held by a thread of its own that lives as long as the app. True once the app
-    owns it; False if something else still does (another multi-Roblox tool, which works just
-    as well; the app keeps trying every few seconds). Safe to call again."""
-    global _keeper
-    if _keeper is None:
-        first_try = threading.Event()
-        _keeper = threading.Thread(target=_keep_roblox_lock, args=(first_try,), daemon=True,
-                                   name="roblox-lock")
-        _keeper.start()
-        first_try.wait(wait)
+def allow_multiple_roblox(wait=KEEPER_WAIT):
+    """Make sure the keeper holds Roblox's one-window lock, so every Roblox opened from now on
+    stays open next to the others. True once it does. False while something else holds it, like
+    another multi-Roblox tool or a Roblox opened first; that's never taken from them, as it would
+    close those windows. The keeper takes the lock as soon as it's free. Safe to call again."""
+    global _app_open
     with _lock:
-        return bool(_held and _held[0][1])
+        if _app_open is None:
+            _app_open = _kernel32.CreateMutexW(None, False, APP_OPEN_NAME)
+        if not _named_object_open(_kernel32.OpenMutexW, KEEPER_NAME):
+            try:
+                subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", KEEPER_SCRIPT],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, close_fds=True,
+                                 creationflags=0x08000000 | 0x00000200)  # no window, own group
+            except OSError:
+                return False
+            end = time.monotonic() + wait
+            while time.monotonic() < end and not _keeper_owns_lock():
+                time.sleep(0.1)
+    return _keeper_owns_lock()
 
 
 def close_roblox(pid, hwnds, timeout=15):
