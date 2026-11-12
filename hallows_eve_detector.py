@@ -1290,9 +1290,53 @@ def find_reconnect_button(img):
     return None
 
 
+def green_wide_buttons(img):
+    """Candidate big green buttons (x0, y0, x1, y1), like Daily Rewards' CLAIM: a wide,
+    mostly filled patch of bright green in the lower part of the window. The green
+    ticks on claimed days are square, so they don't count."""
+    import cv2
+
+    w, h = img.size
+    y_from = int(h * 0.35)
+    a = np.asarray(img.crop((0, y_from, w, h)).convert("RGB")).astype(np.int16)
+    mask = ((a[..., 1] > 190) & (a[..., 0] < 90) & (a[..., 2] < 90)).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    found = []
+    for x, y, bw, bh, area in stats[1:n]:
+        if h * 0.04 <= bh <= h * 0.2 and 2.5 <= bw / bh <= 7 and area / (bw * bh) >= 0.5:
+            found.append((int(x), y_from + int(y), int(x + bw), y_from + int(y + bh)))
+    return sorted(found, key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))
+
+
+def find_daily_rewards(img):
+    """The game's "Daily Rewards" window: {"claim": (x, y) of its green CLAIM button,
+    "close": (x, y) of its red X or None}, in window pixels; None if it isn't showing.
+    A green button alone isn't enough: it has to read CLAIM and the window has to
+    read Daily Rewards."""
+    w, h = img.size
+    for x0, y0, x1, y1 in green_wide_buttons(img)[:2]:
+        if not any(similar(t, "claim") for t, _ in ocr_region(img, (x0, y0, x1, y1))):
+            continue
+        # OCR reads the title as one line or as "DAILY" and "REWARDS" apart.
+        texts = [t for t, _ in ocr_region(img, (0, 0, w, max(1, y0)))]
+        whole = any(similar(t, "dailyrewards", 0.75) or "dailyreward" in normalize(t) for t in texts)
+        apart = (any(similar(t, "daily") for t in texts)
+                 and any(similar(t, "rewards") or similar(t, "reward") for t in texts))
+        if not (whole or apart):
+            continue
+        # Its red X is the top-right one above the button.
+        close = [b for b in red_close_buttons(img) if b[3] <= y0]
+        spot = None
+        if close:
+            bx0, by0, bx1, by1 = max(close, key=lambda b: (b[2], -b[1]))
+            spot = (int((bx0 + bx1) / 2), int((by0 + by1) / 2))
+        return {"claim": (int((x0 + x1) / 2), int((y0 + y1) / 2)), "close": spot}
+    return None
+
+
 class PopupCloser:
     """Clears the screens that block a window: the "Welcome Back~" popup (click its red
-    X), Roblox's "Join Event" card that can sit on top of it (click its ×), and Roblox's
+    X), the game's "Daily Rewards" window (click CLAIM), Roblox's "Join Event" card that can sit on top of it (click its ×), and Roblox's
     "Disconnected" dialog (click Reconnect, then wait for the game to load, which ends
     with the Welcome Back popup).
 
@@ -1304,6 +1348,7 @@ class PopupCloser:
     RETRY_AFTER = 8.0
     RECONNECT_AGAIN_AFTER = 15.0  # if the Disconnected dialog is still (or back) there
     RECONNECT_WAIT = 60.0  # longest wait for the Welcome Back screen after reconnecting
+    CLAIM_STUCK = 30.0  # Daily Rewards still up this soon after CLAIM: close it with its X
 
     def __init__(self, click=click_in_window, on_action=None):
         self.enabled = True
@@ -1317,6 +1362,9 @@ class PopupCloser:
         self.disconnect_checked = {}
         self.reconnect_clicked = {}
         self.reconnecting = {}  # hwnd -> when Reconnect was clicked, until the game is back
+        self.daily_checked = {}
+        self.daily_failed_at = {}
+        self.claimed_at = {}  # hwnd -> when CLAIM was last clicked
 
     def check(self, hwnd, label, img):
         """True if this window is blocked right now (a screen was found and a click was
@@ -1334,6 +1382,8 @@ class PopupCloser:
             waiting = False
         # The Join Event card sits on top of the Welcome Back popup: close it first.
         if self._join_event(hwnd, label, img, now):
+            return True
+        if self._daily_rewards(hwnd, label, img, now):
             return True
         if self._welcome_back(hwnd, label, img, now):
             if waiting:
@@ -1385,6 +1435,37 @@ class PopupCloser:
                                   f"retrying in {self.RETRY_AFTER:.0f} s")
             return True
         self.on_action(True, f"{label}: closed the 'Welcome Back' popup (it hides the hotbar)")
+        return True
+
+    def _daily_rewards(self, hwnd, label, img, now):
+        if not green_wide_buttons(img):
+            return False
+        if now - self.daily_checked.get(hwnd, -self.CONFIRM_EVERY) < self.CONFIRM_EVERY:
+            return False
+        if now - self.daily_failed_at.get(hwnd, -self.RETRY_AFTER) < self.RETRY_AFTER:
+            return False
+        self.daily_checked[hwnd] = now
+        found = find_daily_rewards(img)
+        if found is None:
+            return False
+        # Still there soon after CLAIM (already claimed, or the click didn't land twice):
+        # close it with its X instead of clicking CLAIM forever.
+        stuck = now - self.claimed_at.get(hwnd, -self.CLAIM_STUCK) < self.CLAIM_STUCK
+        if stuck and now - self.claimed_at[hwnd] < self.RETRY_AFTER:
+            return True  # give the claim a moment to go through
+        spot, what = found["claim"], "claimed the 'Daily Rewards'"
+        if stuck and found["close"]:
+            spot, what = found["close"], "closed the 'Daily Rewards' window (still open after CLAIM)"
+        try:
+            self.click(hwnd, *spot)
+        except RuntimeError as e:
+            self.daily_failed_at[hwnd] = time.monotonic()
+            self.on_action(False, f"{label}: couldn't click the 'Daily Rewards' window ({e}); "
+                                  f"retrying in {self.RETRY_AFTER:.0f} s")
+            return True
+        if spot == found["claim"]:
+            self.claimed_at[hwnd] = now
+        self.on_action(True, f"{label}: {what}")
         return True
 
     def _join_event(self, hwnd, label, img, now):

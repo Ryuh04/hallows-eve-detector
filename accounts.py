@@ -277,9 +277,9 @@ def _resolve_share_once(session, code):
         return place_id, link_code
 
 
-def launch(cookie, link, progress=lambda text: None, opener=None, start=None, tracker=None):
-    """Start Roblox as this account, joining the server the link points at. `tracker` is this
-    launch's number (see new_tracker)."""
+def join_uri(cookie, link, progress=lambda text: None, opener=None, tracker=None):
+    """Everything a launch asks Roblox's website for (the server behind a share link, and a
+    join ticket), ready to start: can be done while an old window is still closing."""
     target = parse_server_link(link)
     session = RobloxSession(cookie, opener)
     if "share" in target:
@@ -288,7 +288,15 @@ def launch(cookie, link, progress=lambda text: None, opener=None, start=None, tr
     else:
         place_id, link_code = target["place_id"], target["link_code"]
     progress("Getting a join ticket…")
-    uri = launch_uri(auth_ticket(session), place_id, link_code, tracker)
+    return launch_uri(auth_ticket(session), place_id, link_code, tracker)
+
+
+def launch(cookie, link, progress=lambda text: None, opener=None, start=None, tracker=None,
+           uri=None):
+    """Start Roblox as this account, joining the server the link points at. `tracker` is this
+    launch's number (see new_tracker); `uri` is a join_uri made for it beforehand."""
+    if uri is None:
+        uri = join_uri(cookie, link, progress, opener, tracker)
     progress("Starting Roblox…")
     try:
         (start or os.startfile)(uri)

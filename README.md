@@ -4,7 +4,7 @@ A Windows app that watches your Roblox windows for the **Hallows' Eve** event an
 
 - **Detects the event** in each window (even behind other windows), with a countdown.
 - **Auto equip:** holds the characters you pick during the event, in the order you picked them, skipping any that already have Dracula, and unequips them when it ends.
-- **Anti Disconnect:** reconnects after a disconnect and closes the "Welcome Back" popup.
+- **Anti Disconnect:** reconnects after a disconnect, closes the "Welcome Back" popup and clicks CLAIM on the "Daily Rewards" window.
 - **Auto rebirth:** rebirths whenever your cash covers the next rebirth, with a log.
 - **Trim Roblox RAM:** frees memory your Roblox windows aren't using, every 2 minutes (on by default).
 - **Discord ping** (optional) with each window's private server link. Switch it off per window to detect there without pinging.

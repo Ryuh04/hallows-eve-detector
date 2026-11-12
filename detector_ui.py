@@ -65,7 +65,8 @@ TRIM_EVERY = 120  # seconds between RAM trims while the switch is on
 SESSION_SAVE_EVERY = 5  # seconds between looks at what Relaunch previous session should reopen
 LAUNCH_AT_ONCE = 8  # accounts starting at the same time; any more wait for one of these to finish
 WINDOW_CHECK_EVERY = 0.25  # seconds between looks for a launched account's window
-FOLLOW_CLOSE_GRACE = 1  # seconds a window Follow event moves gets to close itself before it's ended
+CLOSE_GRACE = 1  # seconds a window being relaunched (or moved by Follow event) gets to close
+#                 itself before it's ended
 FOLLOW_CONFIRM = 3  # seconds a window must show the event before accounts move to it
 FOLLOW_MIN_LEFT = 60  # with less left than this, moving (closing, joining, loading) isn't worth it
 FOLLOW_MIN_GONE = 5  # seconds without the banner before accounts go back, at the least...
@@ -3086,22 +3087,38 @@ class App(QMainWindow):
                 if wanted is not None and not wanted():
                     self.events.put(("acct_dropped", None, user_id))
                     continue
+                uri = None
                 if close is not None:
+                    # Ask Roblox's website for the join while the old window closes.
+                    ready = {}
+
+                    def prepare():
+                        try:
+                            ready["uri"] = accounts.join_uri(cookie, link, tracker=tracker)
+                        except Exception as e:
+                            ready["error"] = e
+
+                    preparing = threading.Thread(target=prepare, daemon=True)
+                    preparing.start()
                     post("Closing the old Roblox window…")
                     hwnds = [h for h, p, _ in core.find_roblox_windows() if p == close]
                     self.app_closing[close] = why
-                    grace = FOLLOW_CLOSE_GRACE if why == "Follow event" else 15
-                    if not accounts.close_roblox(close, hwnds, timeout=grace):
+                    if not accounts.close_roblox(close, hwnds, timeout=CLOSE_GRACE):
                         self.app_closing.pop(close, None)
                         raise accounts.AccountError(f"Couldn't close the old Roblox window "
                                                     f"(PID {close}). Close it, then click Launch.")
                     self.events.put(("acct_closed", None, user_id, close))
+                    post("Getting a join ticket…")
+                    preparing.join()
+                    if "error" in ready:
+                        raise ready["error"]
+                    uri = ready["uri"]
 
                 accounts.allow_multiple_roblox()  # quick once the app owns the lock
                 with self.launch_lock:
                     self.launch_waits.add(tracker)
                 before = {pid for _, pid, _ in core.find_roblox_windows()}
-                accounts.launch(cookie, link, progress=post, tracker=tracker)
+                accounts.launch(cookie, link, progress=post, tracker=tracker, uri=uri)
                 post("Waiting for the Roblox window…")
                 self.events.put(("acct_window", None, user_id, name, link,
                                  self._find_launched_window(tracker, before)))
